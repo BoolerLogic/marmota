@@ -243,7 +243,7 @@ func http1xHandler(host string, port string, clientConn net.Conn, serverConn net
 				// Cierre limpio la conexión TCP. No mas peticiones HTTP en esta Conexioón
 				return
 			}
-			if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.WSAECONNRESET) {
+			if errors.Is(err, syscall.ECONNRESET) {
 				// Cierre Abrupto de la conexión TCP. No mas peticiones HTTP en esta Conexioón
 				return
 			}
