@@ -1,6 +1,6 @@
-# Marmota
+# Marmota - High-Performance MITM Proxy
 
-![Marmota Icon](./images/marmota_icon.png)
+<img src="./images/marmota_icon.png" width="350" alt="Marmota Icon" />
 
 Marmota is a cross-platform, high-performance Man-in-the-Middle (MITM) proxy and HTTP/HTTPS traffic analyzer. Built to capture, inspect, and manipulate HTTP/1.1 and HTTP/2 traffic, it provides developers and security engineers with deep visibility into network interactions between clients and servers.
 
