@@ -1,0 +1,36 @@
+# Go build outputs
+/build/bin/
+/build/obj/
+*.exe
+*.out
+*.test
+
+# Frontend (Vite / Svelte)
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.svelte-kit/
+
+# Archivos de configuración local y variables
+.env
+.env.*
+
+# Certificados Criptográficos (Crítico: Previene filtración de claves privadas)
+ca.key
+ca.pem
+*.crt
+*.key
+*.pem
+
+# Archivos temporales del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Logs generados en ejecución
+*.log
+
+# Entornos y directorios de prueba locales
+/test/
+
+# Configuraciones locales de editores/IDE
+.vscode/
+.idea/
