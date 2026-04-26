@@ -1,0 +1,67 @@
+name: Release Marmota
+
+# Esto indica que el servidor solo arrancará cuando crees un Tag que empiece por 'v'
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      # Matriz de sistemas operativos: Linux, Windows, macOS
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Wails en Linux necesita las cabeceras de GTK y WebKit para compilar
+      - name: Install Linux System Dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      # Compilación condicional: Universal para macOS, estándar para Windows/Linux
+      - name: Build Wails Application
+        run: |
+          if [ "${{ matrix.os }}" == "macos-latest" ]; then
+            wails build -platform darwin/universal
+          else
+            wails build
+          fi
+        shell: bash
+
+      # En macOS, empaquetamos el .app indicando explicitamente que es Universal (Intel + Apple Silicon)
+      - name: Zip macOS App Bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd build/bin
+          zip -r Marmota_macOS_Universal.zip *.app
+          rm -rf *.app  
+
+      # Sube los binarios compilados (.exe, binario de linux y el .zip de Mac) a la Release
+      - name: Publish Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/bin/*
