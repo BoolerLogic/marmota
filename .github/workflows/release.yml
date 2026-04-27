@@ -75,7 +75,7 @@ jobs:
 
           echo -e "[Desktop Entry]\nName=Marmota\nExec=/usr/bin/marmota\nIcon=marmota\nType=Application\nCategories=Development;Network;Security;" > deb_pkg/usr/share/applications/marmota.desktop
 
-          echo -e "Package: marmota\nVersion: ${VERSION}\nArchitecture: amd64\nMaintainer: Release Marmota <marmota@github.com>\nDescription: A cross-platform HTTP/HTTPS MITM proxy and network analyzer.\nDepends: libwebkit2gtk-4.0-37 | libwebkit2gtk-4.1-0" > deb_pkg/DEBIAN/control
+          echo -e "Package: marmota\nVersion: ${VERSION}\nArchitecture: amd64\nMaintainer: Release Marmota <marmota@github.com>\nDescription: A cross-platform HTTP/HTTPS MITM proxy and network analyzer.\nDepends: libwebkit2gtk-4.0-37" > deb_pkg/DEBIAN/control
 
           DEB_NAME="marmota_${VERSION}_amd64.deb"
           dpkg-deb --build deb_pkg "build/bin/${DEB_NAME}"
@@ -84,7 +84,7 @@ jobs:
           sudo alien --to-rpm --scripts "${DEB_NAME}"
           rm Marmota
 
-      # Sube los binarios compilados (.exe, binario de linux y el .zip de Mac) a la Release
+      # Sube los binarios compilados (.exe, .deb y .rpm de linux y el .zip de Mac) a la Release
       - name: Publish Release Assets
         uses: softprops/action-gh-release@v2
         with:
