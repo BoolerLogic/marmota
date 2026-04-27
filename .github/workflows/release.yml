@@ -14,7 +14,7 @@ jobs:
     strategy:
       # Matriz de sistemas operativos: Linux, Windows, macOS
       matrix:
-        os: [ ubuntu-22.04, windows-latest, macos-latest ]
+        os: [ ubuntu-22.04, ubuntu-24.04, windows-latest, macos-latest ]
 
     runs-on: ${{ matrix.os }}
 
@@ -34,10 +34,14 @@ jobs:
 
       # Wails en Linux necesita las cabeceras de GTK y WebKit para compilar
       - name: Install Linux System Dependencies
-        if: matrix.os == 'ubuntu-22.04'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev imagemagick alien
+          if [ "${{ matrix.os }}" == "ubuntu-22.04" ]; then
+            sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev imagemagick alien
+          else
+            sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev imagemagick alien
+          fi
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
@@ -60,10 +64,20 @@ jobs:
 
       # 3. Compilación nativa para Linux (.deb y .rpm)
       - name: Build Linux Native Packages
-        if: matrix.os == 'ubuntu-22.04'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          wails build
+
+          # Lógica dinámica para WebKit y Nomenclatura Profesional
+          if [ "${{ matrix.os }}" == "ubuntu-22.04" ]; then
+            wails build
+            WEBKIT_DEP="libwebkit2gtk-4.0-37"
+            SUFFIX="webkit4.0"
+          else
+            wails build -tags webkit2_41
+            WEBKIT_DEP="libwebkit2gtk-4.1-0"
+            SUFFIX="webkit4.1"
+          fi
 
           mkdir -p deb_pkg/usr/bin
           mkdir -p deb_pkg/usr/share/applications
@@ -75,11 +89,14 @@ jobs:
 
           echo -e "[Desktop Entry]\nName=Marmota\nExec=/usr/bin/marmota\nIcon=marmota\nType=Application\nCategories=Development;Network;Security;" > deb_pkg/usr/share/applications/marmota.desktop
 
-          echo -e "Package: marmota\nVersion: ${VERSION}\nArchitecture: amd64\nMaintainer: Release Marmota <marmota@github.com>\nDescription: A cross-platform HTTP/HTTPS MITM proxy and network analyzer.\nDepends: libwebkit2gtk-4.0-37" > deb_pkg/DEBIAN/control
+          # Inyectamos la dependencia en el archivo de control
+          echo -e "Package: marmota\nVersion: ${VERSION}\nArchitecture: amd64\nMaintainer: Release Marmota <marmota@github.com>\nDescription: A cross-platform HTTP/HTTPS MITM proxy and network analyzer.\nDepends: ${WEBKIT_DEP}" > deb_pkg/DEBIAN/control
 
-          DEB_NAME="marmota_${VERSION}_amd64.deb"
+          # Nombre del DEB: marmota_x.y.z_linux_webkit4.1_amd64.deb
+          DEB_NAME="marmota_${VERSION}_linux_${SUFFIX}_amd64.deb"
           dpkg-deb --build deb_pkg "build/bin/${DEB_NAME}"
 
+          # Generar el RPM: marmota-x.y.z-linux-webkit4.1-1.x86_64.rpm
           cd build/bin
           sudo alien --to-rpm --scripts "${DEB_NAME}"
           rm Marmota

@@ -14,6 +14,17 @@ Marmota is a cross-platform, high-performance Man-in-the-Middle (MITM) proxy and
 ## 📥 Download
 You can download the latest executable binaries for Windows, Linux, and macOS from the [Releases page](https://github.com/BoolerLogic/Marmota/releases).
 
+> ### 🐧 Linux Users: Which version should I download?
+> Due to recent updates in Linux distributions, we provide two versions of Marmota. Please choose the one that matches your system:
+> 
+> * **Download `webkit4.1` (Modern)**
+>   * Use this if you are on: **Ubuntu 24.04 or newer**, **Mint 22+**, **Debian 13**, **Fedora 40+**, or rolling releases like **Arch Linux**.
+> 
+> * **Download `webkit4.0` (Legacy)**
+>   * Use this if you are on: **Ubuntu 22.04 or older**, **Mint 21**, **Debian 12 or older**, or **Fedora 39 or older**.
+> 
+> *Note: Debian/Ubuntu-based users should download the `.deb` file. Fedora/RedHat-based users should download the `.rpm` file.*
+
 ---
 
 ## Core Features
