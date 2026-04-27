@@ -42,45 +42,37 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
-      # En macOS, empaquetamos el .app indicando explicitamente que es Universal (Intel + Apple Silicon)
-      - name: Build and Package Artifacts
-        shell: bash
+      # 1. Compilación para Windows
+      - name: Build Windows
+        if: matrix.os == 'windows-latest'
         run: |
-          if [ "${{ matrix.os }}" == "macos-latest" ]; then
-            wails build -platform darwin/universal
-            cd build/bin
-            zip -r Marmota_macOS_Universal.zip *.app
-            rm -rf *.app
+          wails build
+          mv build/bin/Marmota.exe build/bin/Marmota_Windows_x64.exe
 
-          elif [ "${{ matrix.os }}" == "windows-latest" ]; then
-            wails build
-            mv build/bin/Marmota.exe build/bin/Marmota_Windows_amd64.exe
+      # 2. Compilación para macOS (Universal)
+      - name: Build macOS
+        if: matrix.os == 'macos-latest'
+        run: |
+          wails build -platform darwin/universal
+          cd build/bin
+          zip -r Marmota_macOS_Universal.zip *.app
+          rm -rf *.app
 
-          else
-            # 1. Compilamos el binario base de Linux
-            wails build
-
-            # 2. Descargamos linuxdeploy (la herramienta oficial para crear AppImage)
-            wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-            chmod +x linuxdeploy-x86_64.AppImage
-
-            # 3. Creamos el archivo .desktop (El "Acceso Directo" con metadatos que exige Linux)
-            cat <<EOF > marmota.desktop
-            [Desktop Entry]
-            Name=Marmota
-            Exec=Marmota
-            Icon=appicon
-            Type=Application
-            Categories=Development;Network;Security;
-            EOF
-
-            # 4. Empaquetamos el binario, el icono y el .desktop en un solo archivo AppImage
-            ./linuxdeploy-x86_64.AppImage --appdir AppDir --executable build/bin/Marmota --desktop-file marmota.desktop --icon-file build/appicon.png --output appimage
-
-            # 5. Renombramos el archivo final y limpiamos la basura
-            mv Marmota*.AppImage build/bin/Marmota_Linux_amd64.AppImage
-            rm build/bin/Marmota
-          fi
+      # 3. Compilación y creación de AppImage para Linux
+      - name: Build Linux AppImage
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          wails build
+          # Descargar linuxdeploy
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          # Crear archivo desktop
+          echo -e "[Desktop Entry]\nName=Marmota\nExec=Marmota\nIcon=appicon\nType=Application\nCategories=Development;Network;Security;" > marmota.desktop
+          # Ejecutar linuxdeploy (Usamos la variable EXTRA_ARGS para evitar errores de FUSE en Docker/VM)
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --executable build/bin/Marmota --desktop-file marmota.desktop --icon-file build/appicon.png --output appimage
+          mv Marmota*-x86_64.AppImage build/bin/Marmota_Linux_x64.AppImage
+          rm build/bin/Marmota
 
       # Sube los binarios compilados (.exe, binario de linux y el .zip de Mac) a la Release
       - name: Publish Release Assets
