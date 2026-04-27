@@ -99,6 +99,7 @@ jobs:
           # Generar el RPM: marmota-x.y.z-linux-webkit4.1-1.x86_64.rpm
           cd build/bin
           sudo alien --to-rpm --scripts "${DEB_NAME}"
+          mv *.rpm "marmota_${VERSION}_linux_${SUFFIX}_x86_64.rpm"
           rm Marmota
 
       # Sube los binarios compilados (.exe, .deb y .rpm de linux y el .zip de Mac) a la Release
