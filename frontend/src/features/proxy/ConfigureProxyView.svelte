@@ -33,6 +33,7 @@
     let operationState: OperationState = "idle";
     let caMessage = "";
     let caMessageTone: "neutral" | "success" | "error" = "neutral";
+    let resetConfirmDialogOpen = false;
     let resetSuccessDialogOpen = false;
 
     $: operationBusy = operationState !== "idle";
@@ -132,7 +133,34 @@
         }
     }
 
-    async function handleResetCA() {
+    function openResetConfirmDialog() {
+        if (!canResetCA) return;
+
+        caMessage = "";
+        caMessageTone = "neutral";
+        resetConfirmDialogOpen = true;
+    }
+
+    function closeResetConfirmDialog() {
+        if (resetBusy) return;
+
+        resetConfirmDialogOpen = false;
+    }
+
+    function handleConfirmBackdropClick(event: MouseEvent) {
+        if (event.target === event.currentTarget) {
+            closeResetConfirmDialog();
+        }
+    }
+
+    function handleWindowKeydown(event: KeyboardEvent) {
+        if (!resetConfirmDialogOpen || event.key !== "Escape") return;
+
+        event.preventDefault();
+        closeResetConfirmDialog();
+    }
+
+    async function confirmResetCA() {
         if (!canResetCA) return;
 
         operationState = "resetting";
@@ -148,10 +176,13 @@
         } catch (e: unknown) {
             setCaError(e, "CA reset failed.");
         } finally {
+            resetConfirmDialogOpen = false;
             operationState = "idle";
         }
     }
 </script>
+
+<svelte:window on:keydown={handleWindowKeydown} />
 
 <div class="configureView">
     <div class="heroCard">
@@ -308,7 +339,7 @@
                     <button
                         type="button"
                         class="certificateButton dangerButton"
-                        on:click={handleResetCA}
+                        on:click={openResetConfirmDialog}
                         disabled={!canResetCA}
                         title={state === "running"
                             ? "Stop the proxy before resetting the CA"
@@ -337,6 +368,52 @@
         </aside>
     </div>
 </div>
+
+{#if resetConfirmDialogOpen}
+    <div
+        class="confirmOverlay"
+        role="presentation"
+        tabindex="-1"
+        on:click={handleConfirmBackdropClick}
+    >
+        <div
+            class="confirmDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reset-ca-confirm-title"
+            aria-describedby="reset-ca-confirm-message"
+        >
+            <div class="confirmCopy">
+                <span class="eyebrow">Certificate Authority</span>
+                <h3 id="reset-ca-confirm-title">Reset Marmota CA?</h3>
+                <p id="reset-ca-confirm-message" class="confirmText">
+                    This will remove the current local CA and create a new one.
+                    You will need to export and trust the new certificate again
+                    before inspecting HTTPS traffic.
+                </p>
+            </div>
+
+            <div class="confirmActions">
+                <button
+                    type="button"
+                    class="confirmButton secondary"
+                    on:click={closeResetConfirmDialog}
+                    disabled={resetBusy}
+                >
+                    Cancel
+                </button>
+                <button
+                    type="button"
+                    class="confirmButton danger"
+                    on:click={confirmResetCA}
+                    disabled={resetBusy}
+                >
+                    {resetBusy ? "Resetting..." : "Reset CA"}
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}
 
 {#if resetSuccessDialogOpen}
     <AppAlertDialog
@@ -722,6 +799,86 @@
         color: #fecaca;
     }
 
+    .confirmOverlay {
+        position: fixed;
+        inset: 0;
+        z-index: 90;
+        display: grid;
+        place-items: center;
+        padding: 28px;
+        background: rgba(2, 6, 23, 0.68);
+        backdrop-filter: blur(8px);
+    }
+
+    .confirmDialog {
+        width: min(480px, 100%);
+        display: grid;
+        gap: 20px;
+        padding: 22px;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        background: var(--surface-strong);
+        box-shadow: var(--shadow-card);
+    }
+
+    .confirmCopy {
+        display: grid;
+        gap: 8px;
+    }
+
+    .confirmText {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.55;
+    }
+
+    .confirmActions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+
+    .confirmButton {
+        appearance: none;
+        min-height: 38px;
+        padding: 0 14px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: var(--surface-muted);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        transition:
+            border-color 140ms ease,
+            background 140ms ease,
+            transform 140ms ease;
+    }
+
+    .confirmButton:hover:not(:disabled) {
+        transform: translateY(-1px);
+        border-color: var(--line-strong);
+        background: var(--surface-elevated);
+    }
+
+    .confirmButton:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+    }
+
+    .confirmButton.danger {
+        border-color: var(--danger-line);
+        background: rgba(248, 113, 113, 0.1);
+        color: #fecaca;
+    }
+
+    .confirmButton.danger:hover:not(:disabled) {
+        border-color: var(--danger);
+        background: var(--danger-soft);
+    }
+
     @media (max-width: 980px) {
         .heroCard,
         .formHeader,
@@ -744,6 +901,19 @@
     }
 
     @media (max-width: 760px) {
+        .confirmOverlay {
+            padding: 16px;
+        }
+
+        .confirmDialog {
+            padding: 18px;
+        }
+
+        .confirmActions {
+            display: grid;
+            grid-template-columns: 1fr;
+        }
+
         .heroCard,
         .formCard,
         .certificateCard {
