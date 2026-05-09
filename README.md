@@ -4,6 +4,14 @@
 
 Marmota is a cross-platform, high-performance Man-in-the-Middle (MITM) proxy and HTTP/HTTPS traffic analyzer. Built to capture, inspect, and manipulate HTTP/1.1 and HTTP/2 traffic, it provides developers and security engineers with deep visibility into network interactions between clients and servers.
 
+## Project Status
+
+Marmota is currently an experimental/open-source project under active development. Feedback on the architecture, proxy behavior, UI/UX and documentation is welcome.
+
+## Responsible Use
+
+Marmota is intended for debugging, development, research and authorized traffic inspection. Only use it on systems, devices and networks where you have permission to inspect the traffic.
+
 ## Tech Stack
 * **Backend:** Go (Golang)
 * **Frontend:** Svelte (Assisted by OpenAI Codex)

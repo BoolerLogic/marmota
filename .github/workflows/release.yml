@@ -1,6 +1,5 @@
 name: Release Marmota
 
-# Esto indica que el servidor solo arrancará cuando crees un Tag que empiece por 'v'
 on:
   push:
     tags:
@@ -14,7 +13,7 @@ jobs:
     strategy:
       # Matriz de sistemas operativos: Linux, Windows, macOS
       matrix:
-        os: [ ubuntu-22.04, ubuntu-24.04, windows-latest, macos-latest ]
+        os: [ubuntu-22.04, ubuntu-24.04, windows-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
