@@ -28,6 +28,7 @@
     let modalCard: HTMLFormElement | null = null;
     let draftConditions = cloneHistoryFilterConditions(initialConditions);
     let draftOperator: HistoryFilterOperator = initialOperator;
+    let submitting = false;
 
     $: validConditionCount = sanitizeHistoryFilterConditions(draftConditions).length;
 
@@ -115,9 +116,12 @@
     }
 
     function submitFilter() {
+        if (submitting) return;
+
         const conditions = sanitizeHistoryFilterConditions(draftConditions);
         if (conditions.length === 0) return;
 
+        submitting = true;
         dispatch("save", {
             conditions,
             operator: draftOperator,
@@ -138,6 +142,7 @@
         on:submit|preventDefault={submitFilter}
         role="dialog"
         aria-modal="true"
+        aria-busy={submitting}
         aria-labelledby="history-filter-title"
     >
         <div class="modalHeader">
@@ -278,9 +283,9 @@
                 <button
                     type="submit"
                     class="primaryButton"
-                    disabled={validConditionCount === 0}
+                    disabled={submitting || validConditionCount === 0}
                 >
-                    {submitLabel}
+                    {submitting ? "Saving..." : submitLabel}
                 </button>
             </div>
         </div>

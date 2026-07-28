@@ -32,6 +32,7 @@ func main() {
 		},
 		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
 		OnStartup:        app.startup,
+		OnShutdown:       app.shutdown,
 		Bind: []interface{}{
 			app,
 		},
@@ -40,6 +41,8 @@ func main() {
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
 			DisableWindowIcon:    false,
+			IsZoomControlEnabled: true,
+			ZoomFactor:           1.0,
 			// Habilita el modo oscuro nativo de Windows si tu app es oscura
 			Theme: windows.Dark,
 		},

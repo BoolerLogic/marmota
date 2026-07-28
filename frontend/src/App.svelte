@@ -3,10 +3,16 @@
     import {
         CloseProxy,
         ExportCA,
+        GetInitialAppState,
+        OpenConfigDirectory,
         ResetCA,
         StartProxy,
     } from "../wailsjs/go/main/App.js";
-    import { BrowserOpenURL } from "../wailsjs/runtime/runtime.js";
+    import { proxy, settings } from "../wailsjs/go/models";
+    import {
+        BrowserOpenURL,
+        EventsOn,
+    } from "../wailsjs/runtime/runtime.js";
     import {
         setActiveWorkspaceTab,
         workspaceTabStore,
@@ -18,7 +24,11 @@
         errorStore,
         setErrorPanelActive,
     } from "@/features/errors/state/errorStore";
-    import type { ProxyMode, ProxyState } from "@/features/proxy/utils/proxyUi";
+    import type {
+        ProxyMode,
+        ProxyState,
+        UpstreamProxySettings,
+    } from "@/features/proxy/utils/proxyUi";
     import {
         isValidPort,
         resolveListenIp,
@@ -54,6 +64,15 @@
     let specificIp: string = "";
     let port: number = 8080;
     let skipServerCertVerify: boolean = false;
+    let upstreamProxyEnabled: boolean = false;
+    let upstreamProxyHost: string = "";
+    let upstreamProxyPort: number = 1080;
+    let upstreamProxyUsername: string = "";
+    let upstreamProxyPassword: string = "";
+    let configDirectory: string = "";
+    let configFilePath: string = "";
+    let configLoadWarning: string = "";
+    let initialSettingsLoaded = false;
     let panelElement: HTMLElement | null = null;
     let restoredWorkspaceScrollKey = "";
     const projectGithubUrl = "https://github.com/BoolerLogic/Marmota";
@@ -120,7 +139,61 @@
     onMount(() => {
         ensureHttpHistoryCapture();
         ensureErrorCapture();
+
+        const unsubscribeProxyStopped = EventsOn("proxy-stopped", () => {
+            proxyState = "error";
+            proxyError =
+                "The proxy listener stopped unexpectedly. See the Error Log for details.";
+        });
+
+        void loadInitialAppState();
+        return unsubscribeProxyStopped;
     });
+
+    async function loadInitialAppState() {
+        try {
+            const initialState = await GetInitialAppState();
+            const savedConfig = initialState.config;
+            const savedMode = savedConfig?.proxyMode;
+
+            if (
+                savedMode === "local" ||
+                savedMode === "all" ||
+                savedMode === "specific"
+            ) {
+                proxyMode = savedMode;
+            }
+            specificIp = savedConfig?.specificIp ?? "";
+            port =
+                typeof savedConfig?.port === "number"
+                    ? savedConfig.port
+                    : 8080;
+            skipServerCertVerify =
+                savedConfig?.skipServerCertVerify ?? false;
+            upstreamProxyEnabled =
+                savedConfig?.upstreamProxy?.enabled ?? false;
+            upstreamProxyHost =
+                savedConfig?.upstreamProxy?.host ?? "";
+            upstreamProxyPort =
+                typeof savedConfig?.upstreamProxy?.port === "number"
+                    ? savedConfig.upstreamProxy.port
+                    : 1080;
+            upstreamProxyUsername =
+                savedConfig?.upstreamProxy?.username ?? "";
+            upstreamProxyPassword =
+                savedConfig?.upstreamProxy?.password ?? "";
+            configDirectory = initialState.configDirectory ?? "";
+            configFilePath = initialState.configFilePath ?? "";
+            configLoadWarning = initialState.loadWarning ?? "";
+        } catch (error: unknown) {
+            configLoadWarning =
+                error instanceof Error
+                    ? error.message
+                    : "Could not load Marmota configuration.";
+        } finally {
+            initialSettingsLoaded = true;
+        }
+    }
 
     $: setErrorPanelActive(activeTab === "errorLog");
     $: setHttpHistoryPanelActive(activeTab === "httpHistory");
@@ -154,15 +227,37 @@
     }
 
     async function onStartProxy(
-        ip: string,
+        mode: ProxyMode,
+        selectedSpecificIp: string,
         port: number,
         skipServerCertVerify: boolean,
+        upstreamProxy: UpstreamProxySettings,
     ) {
+        if (!initialSettingsLoaded) {
+            throw new Error("Marmota configuration is still loading.");
+        }
+
         proxyState = "loading";
         proxyError = null;
 
         try {
-            await StartProxy(ip, port, skipServerCertVerify);
+            await StartProxy(
+                settings.ProxyConfig.createFrom({
+                    schemaVersion: 1,
+                    proxyMode: mode,
+                    specificIp: selectedSpecificIp.trim(),
+                    port,
+                    skipServerCertVerify,
+                    upstreamProxy: proxy.UpstreamProxyConfig.createFrom({
+                        enabled: upstreamProxy.enabled,
+                        host: upstreamProxy.host.trim(),
+                        port: upstreamProxy.port,
+                        username: upstreamProxy.username,
+                        password: upstreamProxy.password,
+                    }),
+                }),
+            );
+            configLoadWarning = "";
             proxyState = "running";
         } catch (e: unknown) {
             proxyState = "error";
@@ -189,6 +284,10 @@
 
     async function onResetCA() {
         await ResetCA();
+    }
+
+    async function onOpenConfigDirectory() {
+        await OpenConfigDirectory();
     }
 </script>
 
@@ -293,10 +392,20 @@
                         {onCloseProxy}
                         {onExportCA}
                         {onResetCA}
+                        {onOpenConfigDirectory}
+                        {configDirectory}
+                        {configFilePath}
+                        {configLoadWarning}
+                        settingsReady={initialSettingsLoaded}
                         bind:proxyMode
                         bind:specificIp
                         bind:port
                         bind:skipServerCertVerify
+                        bind:upstreamProxyEnabled
+                        bind:upstreamProxyHost
+                        bind:upstreamProxyPort
+                        bind:upstreamProxyUsername
+                        bind:upstreamProxyPassword
                     />
                 {:else if activeTab === "httpHistory"}
                     <HttpHistoryView />

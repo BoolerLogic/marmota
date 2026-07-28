@@ -1248,6 +1248,13 @@
                             headBlockStr={selectedEntry.response
                                 ?.headBlockStr ?? ""}
                             bodyStr={selectedEntry.response?.bodyStr ?? ""}
+                            allowHtmlRender={true}
+                            bodyIsEncoded={(selectedEntry.response
+                                ?.unsupportedContentEncodings.length ?? 0) >
+                                0 ||
+                                (selectedEntry.response
+                                    ?.contentDecodingFailed ??
+                                    false)}
                             emptyLabel="No saved response"
                             searchQuery={responseBodyQuery}
                             bind:searchInput={blockSearchInputs.responseBody}

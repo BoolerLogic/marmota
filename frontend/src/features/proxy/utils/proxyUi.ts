@@ -1,5 +1,12 @@
 export type ProxyState = "idle" | "loading" | "running" | "error";
 export type ProxyMode = "local" | "all" | "specific";
+export type UpstreamProxySettings = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+};
 
 export const PORT_MIN = 0;
 export const PORT_MAX = 65535; // Standard TCP/UDP port range.
@@ -33,4 +40,68 @@ export function isValidIP(str: string): boolean {
 export function isValidPort(port: number | null): boolean {
   if (port === null) return false;
   return port >= PORT_MIN && port <= PORT_MAX;
+}
+
+export function isValidUpstreamProxyHost(host: string): boolean {
+  const normalizedHost = host.trim();
+  const encodedLength = new TextEncoder().encode(normalizedHost).length;
+  if (
+    normalizedHost.length === 0 ||
+    normalizedHost.length > 253 ||
+    encodedLength > 255
+  ) {
+    return false;
+  }
+
+  if (/[\/\\\s]/.test(normalizedHost)) return false;
+
+  if (!normalizedHost.includes(":")) return true;
+
+  const hasOpeningBracket = normalizedHost.startsWith("[");
+  const hasClosingBracket = normalizedHost.endsWith("]");
+  if (hasOpeningBracket !== hasClosingBracket) return false;
+
+  const ipv6Host =
+    hasOpeningBracket && hasClosingBracket
+      ? normalizedHost.slice(1, -1)
+      : normalizedHost;
+  try {
+    new URL(`http://[${ipv6Host}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isValidUpstreamProxyPort(port: number | null): boolean {
+  if (port === null) return false;
+  return Number.isInteger(port) && port >= 1 && port <= PORT_MAX;
+}
+
+export function hasValidUpstreamProxyCredentials(
+  username: string,
+  password: string,
+): boolean {
+  const usernameLength = new TextEncoder().encode(username).length;
+  const passwordLength = new TextEncoder().encode(password).length;
+  const bothEmpty = username.length === 0 && password.length === 0;
+  const bothPresent = username.length > 0 && password.length > 0;
+
+  return (
+    (bothEmpty || bothPresent) &&
+    usernameLength <= 255 &&
+    passwordLength <= 255
+  );
+}
+
+export function isValidUpstreamProxy(
+  settings: UpstreamProxySettings,
+): boolean {
+  if (!settings.enabled) return true;
+
+  return (
+    isValidUpstreamProxyHost(settings.host) &&
+    isValidUpstreamProxyPort(settings.port) &&
+    hasValidUpstreamProxyCredentials(settings.username, settings.password)
+  );
 }

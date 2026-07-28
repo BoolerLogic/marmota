@@ -11,6 +11,7 @@ import { bridge } from "../../../../wailsjs/go/models";
 import {
     clearHistoryDetailCache,
     invalidateHistoryEntryDetail,
+    removeHistoryEntryDetail,
     type RequestView,
     type ResponseView,
 } from "./historyDetailCache";
@@ -55,6 +56,8 @@ export type ResponseSummary = {
     path: string;
     statusCode: number | null;
     receivedAtMs: number;
+    unsupportedContentEncodings: string[];
+    contentDecodingFailed: boolean;
 };
 
 export type HistoryEntry = {
@@ -94,6 +97,7 @@ type HistoryRequestSummaryPayload = {
     scheme?: string;
     receivedAtMs?: number;
     filterMatches?: bridge.HistoryFilterMatch[];
+    evaluatedFilters?: bridge.HistoryFilterMatch[];
 };
 
 type HistoryResponseSummaryPayload = {
@@ -104,6 +108,9 @@ type HistoryResponseSummaryPayload = {
     statusCode?: number;
     receivedAtMs?: number;
     filterMatches?: bridge.HistoryFilterMatch[];
+    evaluatedFilters?: bridge.HistoryFilterMatch[];
+    unsupportedContentEncodings?: string[];
+    contentDecodingFailed?: boolean;
 };
 
 const localTimeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -130,6 +137,15 @@ let httpHistoryPanelActive = false;
 
 const filterKeysByEntryId = new Map<string, Set<string>>();
 const pendingEntryIdsByFilterKey = new Map<string, Set<string>>();
+const activeFilterVersionsById = new Map<string, number>();
+type FilterUpsertOperation = {
+    filterId: string;
+    filterKey: string;
+    mutationToken: symbol;
+    pendingEntryIds: Set<string>;
+};
+const pendingFilterUpsertsById = new Map<string, FilterUpsertOperation>();
+const latestFilterMutationTokensById = new Map<string, symbol>();
 
 function publishHistoryState() {
     set(state);
@@ -196,7 +212,28 @@ function normalizeResponseSummary(
         path: "",
         statusCode: payload.statusCode ?? null,
         receivedAtMs: payload.receivedAtMs ?? Date.now(),
+        unsupportedContentEncodings: normalizeStringArray(
+            payload.unsupportedContentEncodings,
+        ),
+        contentDecodingFailed: payload.contentDecodingFailed ?? false,
     };
+}
+
+function normalizeStringArray(
+    values: string[] | null | undefined,
+): string[] {
+    if (!Array.isArray(values)) {
+        return [];
+    }
+
+    return Array.from(
+        new Set(
+            values
+                .filter((value): value is string => typeof value === "string")
+                .map((value) => value.trim().toLowerCase())
+                .filter(Boolean),
+        ),
+    );
 }
 
 export function getHistoryFilterKey(filterId: string, version: number): string {
@@ -209,6 +246,53 @@ function setFilterSyncing(filterKey: string, syncing: boolean) {
     } else {
         state.syncingFilterKeys.delete(filterKey);
     }
+}
+
+function isLatestFilterUpsert(operation: FilterUpsertOperation): boolean {
+    return (
+        latestFilterMutationTokensById.get(operation.filterId) ===
+        operation.mutationToken
+    );
+}
+
+function releaseFilterUpsertSync(operation: FilterUpsertOperation): boolean {
+    if (
+        pendingEntryIdsByFilterKey.get(operation.filterKey) !==
+        operation.pendingEntryIds
+    ) {
+        return false;
+    }
+
+    pendingEntryIdsByFilterKey.delete(operation.filterKey);
+    setFilterSyncing(operation.filterKey, false);
+    return true;
+}
+
+function moveFilterUpsertSync(
+    operation: FilterUpsertOperation,
+    nextFilterKey: string,
+) {
+    if (operation.filterKey === nextFilterKey) {
+        return;
+    }
+
+    releaseFilterUpsertSync(operation);
+    operation.filterKey = nextFilterKey;
+    pendingEntryIdsByFilterKey.set(
+        operation.filterKey,
+        operation.pendingEntryIds,
+    );
+    setFilterSyncing(operation.filterKey, true);
+}
+
+function supersedePendingFilterUpsert(filterId: string) {
+    const pendingOperation = pendingFilterUpsertsById.get(filterId);
+    if (!pendingOperation) {
+        return;
+    }
+
+    pendingFilterUpsertsById.delete(filterId);
+    releaseFilterUpsertSync(pendingOperation);
 }
 
 function removeEntryIdFromArray(entryIds: string[], entryId: string): boolean {
@@ -380,6 +464,65 @@ function applyEntryFilterMatches(
     filterKeysByEntryId.set(entryId, nextFilterKeys);
 }
 
+function applyEventFilterEvaluation(
+    entryId: string,
+    matches: bridge.HistoryFilterMatch[] | null | undefined,
+    evaluatedFilters:
+        | bridge.HistoryFilterMatch[]
+        | null
+        | undefined,
+) {
+    // Compatibility with summaries emitted by an older backend.
+    if (!Array.isArray(evaluatedFilters)) {
+        applyEntryFilterMatches(entryId, matches);
+        return;
+    }
+
+    const matchingFilterKeys = new Set(
+        normalizeFilterMatches(matches).map((match) =>
+            getHistoryFilterKey(match.filterId, match.version),
+        ),
+    );
+    const currentFilterKeys = new Set(
+        filterKeysByEntryId.get(entryId) ?? [],
+    );
+
+    for (const evaluatedFilter of normalizeFilterMatches(
+        evaluatedFilters,
+    )) {
+        const activeVersion = activeFilterVersionsById.get(
+            evaluatedFilter.filterId,
+        );
+
+        // A delayed event from an older filter version is not authoritative
+        // for the version currently displayed by the tab.
+        if (
+            activeVersion === undefined ||
+            activeVersion !== evaluatedFilter.version
+        ) {
+            continue;
+        }
+
+        const filterKey = getHistoryFilterKey(
+            evaluatedFilter.filterId,
+            evaluatedFilter.version,
+        );
+        if (matchingFilterKeys.has(filterKey)) {
+            addEntryToFilterMembership(filterKey, entryId);
+            currentFilterKeys.add(filterKey);
+        } else {
+            removeEntryFromFilterMembership(filterKey, entryId);
+            currentFilterKeys.delete(filterKey);
+        }
+    }
+
+    if (currentFilterKeys.size === 0) {
+        filterKeysByEntryId.delete(entryId);
+    } else {
+        filterKeysByEntryId.set(entryId, currentFilterKeys);
+    }
+}
+
 function applyHistoryFilterMatchesBatch(
     results: bridge.HistoryEntryFilterMatches[],
     targetFilterId?: string,
@@ -509,7 +652,7 @@ function removeHistoryEntryFromState(entryId: string): boolean {
     removeAllFilterMembershipsForEntryId(entryId);
     clearPendingFilterSyncEntryId(entryId);
     state.entriesById.delete(entryId);
-    invalidateHistoryEntryDetail(entryId);
+    removeHistoryEntryDetail(entryId);
 
     if (state.selectedId === entryId) {
         state.selectedId = fallbackSelectedId;
@@ -554,7 +697,11 @@ function applyRequestSummary(payload: HistoryRequestSummaryPayload) {
             request,
             null,
         );
-        applyEntryFilterMatches(request.id, payload.filterMatches);
+        applyEventFilterEvaluation(
+            request.id,
+            payload.filterMatches,
+            payload.evaluatedFilters,
+        );
         markEntryDirtyForPendingFilterSyncs(request.id);
         return;
     }
@@ -569,7 +716,11 @@ function applyRequestSummary(payload: HistoryRequestSummaryPayload) {
         markEntryRead(currentEntry);
     }
 
-    applyEntryFilterMatches(request.id, payload.filterMatches);
+    applyEventFilterEvaluation(
+        request.id,
+        payload.filterMatches,
+        payload.evaluatedFilters,
+    );
     invalidateHistoryEntryDetail(request.id);
     markEntryDirtyForPendingFilterSyncs(request.id);
 }
@@ -585,7 +736,11 @@ function applyResponseSummary(payload: HistoryResponseSummaryPayload) {
             null,
             response,
         );
-        applyEntryFilterMatches(response.id, payload.filterMatches);
+        applyEventFilterEvaluation(
+            response.id,
+            payload.filterMatches,
+            payload.evaluatedFilters,
+        );
         markEntryDirtyForPendingFilterSyncs(response.id);
         return;
     }
@@ -595,7 +750,11 @@ function applyResponseSummary(payload: HistoryResponseSummaryPayload) {
         markEntryRead(currentEntry);
     }
 
-    applyEntryFilterMatches(response.id, payload.filterMatches);
+    applyEventFilterEvaluation(
+        response.id,
+        payload.filterMatches,
+        payload.evaluatedFilters,
+    );
     invalidateHistoryEntryDetail(response.id);
     markEntryDirtyForPendingFilterSyncs(response.id);
 }
@@ -649,24 +808,26 @@ export function setHttpHistoryPanelActive(active: boolean) {
 }
 
 async function reconcilePendingEntryIdsForFilter(
+    operation: FilterUpsertOperation,
     filterId: string,
     version: number,
 ) {
-    const filterKey = getHistoryFilterKey(filterId, version);
-    const pendingEntryIds = pendingEntryIdsByFilterKey.get(filterKey);
-    if (!pendingEntryIds) {
-        return;
-    }
-
-    while (pendingEntryIds.size > 0) {
-        const entryIdsSnapshot = Array.from(pendingEntryIds);
-        pendingEntryIds.clear();
+    while (
+        isLatestFilterUpsert(operation) &&
+        operation.pendingEntryIds.size > 0
+    ) {
+        const entryIdsSnapshot = Array.from(operation.pendingEntryIds);
+        operation.pendingEntryIds.clear();
 
         const results = await GetHistoryFilterMatchesForEntries(
             bridge.GetHistoryFilterMatchesForEntriesParams.createFrom({
                 entryIds: entryIdsSnapshot.map(toBackendHistoryId),
             }),
         );
+
+        if (!isLatestFilterUpsert(operation)) {
+            return;
+        }
 
         applyHistoryFilterMatchesBatch(results, filterId, version);
         publishHistoryState();
@@ -677,9 +838,22 @@ export async function upsertHistoryFilterTab(
     tab: HistoryFilterTabConfig,
 ): Promise<{ filterId: string; version: number; matchingIds: string[] }> {
     const requestedFilterKey = getHistoryFilterKey(tab.id, tab.filterVersion);
-    const pendingEntryIds = new Set<string>();
+    const previousActiveVersion = activeFilterVersionsById.get(tab.id);
+    const operation: FilterUpsertOperation = {
+        filterId: tab.id,
+        filterKey: requestedFilterKey,
+        mutationToken: Symbol(`upsert:${requestedFilterKey}`),
+        pendingEntryIds: new Set<string>(),
+    };
 
-    pendingEntryIdsByFilterKey.set(requestedFilterKey, pendingEntryIds);
+    supersedePendingFilterUpsert(tab.id);
+    pendingFilterUpsertsById.set(tab.id, operation);
+    latestFilterMutationTokensById.set(tab.id, operation.mutationToken);
+    activeFilterVersionsById.set(tab.id, tab.filterVersion);
+    pendingEntryIdsByFilterKey.set(
+        requestedFilterKey,
+        operation.pendingEntryIds,
+    );
     setFilterSyncing(requestedFilterKey, true);
     publishHistoryState();
 
@@ -692,37 +866,71 @@ export async function upsertHistoryFilterTab(
                 operator: tab.operator,
             }),
         );
-        const resolvedFilterKey = getHistoryFilterKey(result.filterId, result.version);
+        const normalizedResult = {
+            filterId: result.filterId,
+            version: result.version,
+            matchingIds: result.matchingIds.map((id) => String(id)),
+        };
+
+        if (!isLatestFilterUpsert(operation)) {
+            return normalizedResult;
+        }
+
+        const resolvedFilterKey = getHistoryFilterKey(
+            result.filterId,
+            result.version,
+        );
+        if (
+            result.filterId !== tab.id &&
+            activeFilterVersionsById.get(tab.id) === tab.filterVersion
+        ) {
+            activeFilterVersionsById.delete(tab.id);
+        }
+        activeFilterVersionsById.set(result.filterId, result.version);
 
         if (resolvedFilterKey !== requestedFilterKey) {
-            pendingEntryIdsByFilterKey.delete(requestedFilterKey);
-            pendingEntryIdsByFilterKey.set(resolvedFilterKey, pendingEntryIds);
-            setFilterSyncing(requestedFilterKey, false);
+            moveFilterUpsertSync(operation, resolvedFilterKey);
         }
 
         removeAllFilterMembershipsForFilterId(result.filterId, resolvedFilterKey);
         replaceFilterMembership(
             resolvedFilterKey,
-            result.matchingIds.map((id) => String(id)),
+            normalizedResult.matchingIds,
         );
         publishHistoryState();
 
-        await reconcilePendingEntryIdsForFilter(result.filterId, result.version);
+        await reconcilePendingEntryIdsForFilter(
+            operation,
+            result.filterId,
+            result.version,
+        );
 
-        pendingEntryIdsByFilterKey.delete(resolvedFilterKey);
-        setFilterSyncing(resolvedFilterKey, false);
-        publishHistoryState();
-
-        return {
-            filterId: result.filterId,
-            version: result.version,
-            matchingIds: result.matchingIds.map((id) => String(id)),
-        };
+        return normalizedResult;
     } catch (error) {
-        pendingEntryIdsByFilterKey.delete(requestedFilterKey);
-        setFilterSyncing(requestedFilterKey, false);
-        publishHistoryState();
+        if (
+            isLatestFilterUpsert(operation) &&
+            activeFilterVersionsById.get(tab.id) === tab.filterVersion
+        ) {
+            if (previousActiveVersion === undefined) {
+                activeFilterVersionsById.delete(tab.id);
+            } else {
+                activeFilterVersionsById.set(tab.id, previousActiveVersion);
+            }
+        }
         throw error;
+    } finally {
+        const wasLatestOperation = isLatestFilterUpsert(operation);
+        const releasedSyncState = releaseFilterUpsertSync(operation);
+
+        if (pendingFilterUpsertsById.get(tab.id) === operation) {
+            pendingFilterUpsertsById.delete(tab.id);
+        }
+        if (wasLatestOperation) {
+            latestFilterMutationTokensById.delete(tab.id);
+        }
+        if (wasLatestOperation || releasedSyncState) {
+            publishHistoryState();
+        }
     }
 }
 
@@ -731,18 +939,35 @@ export async function removeHistoryFilterTab(
     version: number,
 ) {
     const filterKey = getHistoryFilterKey(filterId, version);
+    const mutationToken = Symbol(`remove:${filterKey}`);
 
-    await RemoveActiveHistoryFilter(
-        bridge.RemoveActiveHistoryFilterParams.createFrom({
-            filterId,
-            version,
-        }),
-    );
+    supersedePendingFilterUpsert(filterId);
+    latestFilterMutationTokensById.set(filterId, mutationToken);
 
-    pendingEntryIdsByFilterKey.delete(filterKey);
-    setFilterSyncing(filterKey, false);
-    removeAllFilterMembershipsForFilterId(filterId);
-    publishHistoryState();
+    try {
+        await RemoveActiveHistoryFilter(
+            bridge.RemoveActiveHistoryFilterParams.createFrom({
+                filterId,
+                version,
+            }),
+        );
+
+        if (latestFilterMutationTokensById.get(filterId) !== mutationToken) {
+            return;
+        }
+
+        if (activeFilterVersionsById.get(filterId) === version) {
+            activeFilterVersionsById.delete(filterId);
+        }
+        pendingEntryIdsByFilterKey.delete(filterKey);
+        setFilterSyncing(filterKey, false);
+        removeAllFilterMembershipsForFilterId(filterId);
+        publishHistoryState();
+    } finally {
+        if (latestFilterMutationTokensById.get(filterId) === mutationToken) {
+            latestFilterMutationTokensById.delete(filterId);
+        }
+    }
 }
 
 export async function syncPersistedHistoryFilters(

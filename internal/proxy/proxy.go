@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -11,19 +12,113 @@ import (
 	"marmota/internal/bridge"
 	"marmota/internal/h1x"
 	"marmota/internal/h2"
+	"marmota/internal/utils"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	xproxy "golang.org/x/net/proxy"
 )
 
+const (
+	outboundConnectTimeout = 30 * time.Second
+	tlsHandshakeTimeout    = 30 * time.Second
+	inboundHeaderTimeout   = 15 * time.Second
+)
+
+type UpstreamProxyConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Host     string `json:"host"`
+	Port     uint16 `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
 type ConfigProxy struct {
-	IP                   string `json:"ip"`
-	Port                 uint16 `json:"port"`
-	SkipServerCertVerify bool   `json:"skipServerCertVerify"`
+	IP                   string              `json:"ip"`
+	Port                 uint16              `json:"port"`
+	SkipServerCertVerify bool                `json:"skipServerCertVerify"`
+	UpstreamProxy        UpstreamProxyConfig `json:"upstreamProxy"`
+}
+
+type handlerConfig struct {
+	skipServerCertVerify bool
+	outboundDialer       xproxy.Dialer
+	httpTransport        *http.Transport
+	connections          *connectionRegistry
+	lifecycleContext     context.Context
+	caCert               *x509.Certificate
+	caPrivateKey         *rsa.PrivateKey
+}
+
+type runningProxy struct {
+	server          *http.Server
+	listener        net.Listener
+	httpTransport   *http.Transport
+	connections     *connectionRegistry
+	cancelLifecycle context.CancelFunc
+}
+
+type connectionRegistry struct {
+	mu          sync.Mutex
+	connections map[net.Conn]struct{}
+	closed      bool
+}
+
+func newConnectionRegistry() *connectionRegistry {
+	return &connectionRegistry{
+		connections: make(map[net.Conn]struct{}),
+	}
+}
+
+func (registry *connectionRegistry) add(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+
+	registry.mu.Lock()
+	if registry.closed {
+		registry.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	registry.connections[conn] = struct{}{}
+	registry.mu.Unlock()
+	return true
+}
+
+func (registry *connectionRegistry) remove(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+
+	registry.mu.Lock()
+	delete(registry.connections, conn)
+	registry.mu.Unlock()
+}
+
+func (registry *connectionRegistry) closeAll() error {
+	registry.mu.Lock()
+	registry.closed = true
+	connections := make([]net.Conn, 0, len(registry.connections))
+	for conn := range registry.connections {
+		connections = append(connections, conn)
+		delete(registry.connections, conn)
+	}
+	registry.mu.Unlock()
+
+	closeErrors := make([]error, 0)
+	for _, conn := range connections {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	return errors.Join(closeErrors...)
 }
 
 var globalID atomic.Uint64
@@ -33,66 +128,235 @@ func newAtomicID() uint64 {
 	return globalID.Add(1)
 }
 
-var server *http.Server
-var currentCACert *x509.Certificate
-var currentCAPrivKey *rsa.PrivateKey
-var skipServerCertVerify bool
+var lifecycleMu sync.Mutex
+var activeProxy *runningProxy
 
 func StartProxy(config ConfigProxy) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
+	if activeProxy != nil {
+		return errors.New("the proxy is already running")
+	}
+
 	// Generamos nuestro CA al arrancar el programa.
-	var err error
-	currentCACert, currentCAPrivKey, err = GetOrCreateCA()
+	caCert, caPrivateKey, err := GetOrCreateCA()
 	if err != nil {
 		return err
 	}
 
-	skipServerCertVerify = config.SkipServerCertVerify
+	configuredOutboundDialer, err := buildOutboundDialer(config.UpstreamProxy)
+	if err != nil {
+		return err
+	}
 
-	server = &http.Server{
-		Handler: http.HandlerFunc(proxyHandler),
+	connectionTracker := newConnectionRegistry()
+	lifecycleContext, cancelLifecycle := context.WithCancel(context.Background())
+	httpTransport := newHTTPForwardTransport(
+		configuredOutboundDialer,
+		connectionTracker,
+	)
+	runtimeConfig := handlerConfig{
+		skipServerCertVerify: config.SkipServerCertVerify,
+		outboundDialer:       configuredOutboundDialer,
+		httpTransport:        httpTransport,
+		connections:          connectionTracker,
+		lifecycleContext:     lifecycleContext,
+		caCert:               caCert,
+		caPrivateKey:         caPrivateKey,
+	}
+
+	nextServer := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			proxyHandler(w, r, runtimeConfig)
+		}),
+		ReadHeaderTimeout: inboundHeaderTimeout,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// #9 net.Listen hace esto:
 	// #8 - Crea Socket
 	// #8 - Hace bind() -> Asocia el Socket a una direccion Local (IP + Puerto
 	// #8 - Hace listen() -> Crea una cola de conexiones pendientes
-	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", config.IP, config.Port))
+	listenAddress := net.JoinHostPort(config.IP, strconv.Itoa(int(config.Port)))
+	ln, err := net.Listen("tcp", listenAddress)
 	if err != nil {
+		cancelLifecycle()
 		return err
 	}
 
-	go server.Serve(ln)
+	instance := &runningProxy{
+		server:          nextServer,
+		listener:        ln,
+		httpTransport:   httpTransport,
+		connections:     connectionTracker,
+		cancelLifecycle: cancelLifecycle,
+	}
+	activeProxy = instance
 
-	log.Printf("🔥 Native MITM proxy listening on %s:%d", config.IP, config.Port)
+	go func(instance *runningProxy) {
+		if serveErr := nextServer.Serve(ln); serveErr != nil &&
+			!errors.Is(serveErr, http.ErrServerClosed) {
+			bridge.EmitError(fmt.Sprintf("MITM proxy listener stopped unexpectedly: %v", serveErr))
+			instance.cancelLifecycle()
+			instance.httpTransport.CloseIdleConnections()
+			_ = instance.connections.closeAll()
+
+			lifecycleMu.Lock()
+			wasActiveProxy := false
+			if activeProxy == instance {
+				activeProxy = nil
+				wasActiveProxy = true
+			}
+			lifecycleMu.Unlock()
+			if wasActiveProxy {
+				bridge.EmitProxyStopped()
+			}
+		}
+	}(instance)
+
+	log.Printf("🔥 Native MITM proxy listening on %s", ln.Addr())
 
 	return nil
 }
 
 func CloseProxy() error {
-	if server == nil {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
+	if activeProxy == nil {
 		return errors.New("cannot close the proxy because it has not been started yet")
 	}
 
-	if err := server.Close(); err != nil {
-		return err
+	instance := activeProxy
+	activeProxy = nil
+
+	instance.cancelLifecycle()
+	instance.httpTransport.CloseIdleConnections()
+	serverErr := instance.server.Close()
+	listenerErr := instance.listener.Close()
+	if errors.Is(listenerErr, net.ErrClosed) {
+		listenerErr = nil
 	}
+	connectionsErr := instance.connections.closeAll()
 
-	server = nil
-
-	return nil
+	return errors.Join(serverErr, listenerErr, connectionsErr)
 }
 
 func IsProxyActive() bool {
-	return server != nil
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	return activeProxy != nil
 }
 
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
+func ValidateConfig(config ConfigProxy) error {
+	if net.ParseIP(strings.TrimSpace(config.IP)) == nil {
+		return errors.New("proxy listen IP is invalid")
+	}
+	if config.Port == 0 {
+		return errors.New("proxy listen port must be between 1 and 65535")
+	}
+	if _, err := buildOutboundDialer(config.UpstreamProxy); err != nil {
+		return err
+	}
+	return nil
+}
+
+func buildOutboundDialer(config UpstreamProxyConfig) (xproxy.Dialer, error) {
+	directDialer := &net.Dialer{
+		Timeout:   outboundConnectTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+
+	if !config.Enabled {
+		return directDialer, nil
+	}
+
+	host := normalizeHost(config.Host)
+	if host == "" {
+		return nil, errors.New("SOCKS5 upstream proxy host is required")
+	}
+	if strings.ContainsAny(host, "/\\ \t\r\n") {
+		return nil, errors.New("SOCKS5 upstream proxy host is invalid")
+	}
+	if len([]byte(host)) > 255 {
+		return nil, errors.New("SOCKS5 upstream proxy host must not exceed 255 bytes")
+	}
+	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		return nil, errors.New("SOCKS5 upstream proxy host is invalid")
+	}
+	if config.Port == 0 {
+		return nil, errors.New("SOCKS5 upstream proxy port must be between 1 and 65535")
+	}
+
+	username := config.Username
+	password := config.Password
+	if (username == "") != (password == "") {
+		return nil, errors.New("SOCKS5 username and password must either both be set or both be empty")
+	}
+	if len([]byte(username)) > 255 || len([]byte(password)) > 255 {
+		return nil, errors.New("SOCKS5 username and password must not exceed 255 bytes")
+	}
+
+	var auth *xproxy.Auth
+	if username != "" {
+		auth = &xproxy.Auth{
+			User:     username,
+			Password: password,
+		}
+	}
+
+	proxyAddress := net.JoinHostPort(host, strconv.Itoa(int(config.Port)))
+	dialer, err := xproxy.SOCKS5("tcp", proxyAddress, auth, directDialer)
+	if err != nil {
+		return nil, fmt.Errorf("could not configure SOCKS5 upstream proxy: %w", err)
+	}
+
+	return dialer, nil
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if len(host) >= 2 && strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host[1 : len(host)-1]
+	}
+	return host
+}
+
+func dialOutbound(ctx context.Context, dialer xproxy.Dialer, address string) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, outboundConnectTimeout)
+	defer cancel()
+
+	if contextDialer, ok := dialer.(xproxy.ContextDialer); ok {
+		return contextDialer.DialContext(dialCtx, "tcp", address)
+	}
+
+	return nil, errors.New("the configured outbound dialer does not support context cancellation")
+}
+
+func contextBoundToProxyLifecycle(
+	lifecycleContext context.Context,
+	operationContext context.Context,
+) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(lifecycleContext)
+	stopOperationCancellation := context.AfterFunc(operationContext, cancel)
+
+	return ctx, func() {
+		stopOperationCancellation()
+		cancel()
+	}
+}
+
+func proxyHandler(w http.ResponseWriter, r *http.Request, config handlerConfig) {
 	// fmt.Printf(" > Nueva Petición:\n%v\n", r)
 
+	if isCleartextHTTP2Request(r) {
+		writeCleartextHTTP2Unsupported(w)
+		return
+	}
+
 	if r.Method != http.MethodConnect {
-		msg := fmt.Sprintf("Method %s not allowed: only HTTPS (CONNECT) is supported", r.Method)
-		http.Error(w, msg, http.StatusMethodNotAllowed)
-		bridge.EmitError(msg)
+		forwardHTTP1(w, r, config)
 		return
 	}
 
@@ -135,27 +399,90 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	host, port, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		http.Error(w, "Invalid CONNECT target", http.StatusBadRequest)
+		bridge.EmitError(fmt.Sprintf(
+			"Could not parse CONNECT target %q: %v",
+			r.Host,
+			err,
+		))
+		return
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 || strings.TrimSpace(host) == "" {
+		http.Error(w, "Invalid CONNECT target", http.StatusBadRequest)
+		bridge.EmitError(fmt.Sprintf(
+			"Invalid CONNECT target %q",
+			r.Host,
+		))
+		return
+	}
+
+	certTLS, err := GenFakeCertSignedByCA(
+		host,
+		config.caCert,
+		config.caPrivateKey,
+	)
+	if err != nil {
+		http.Error(w, "Could not prepare TLS interception", http.StatusInternalServerError)
+		bridge.EmitError(fmt.Sprintf(
+			"Could not generate certificate for %s:%s: %v",
+			host,
+			port,
+			err,
+		))
+		return
+	}
+
+	outboundDialContext, cancelOutboundDial :=
+		contextBoundToProxyLifecycle(config.lifecycleContext, r.Context())
+	outboundConn, err := dialOutbound(
+		outboundDialContext,
+		config.outboundDialer,
+		net.JoinHostPort(host, port),
+	)
+	cancelOutboundDial()
+	if err != nil {
+		statusCode := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			statusCode = http.StatusGatewayTimeout
+		} else if config.lifecycleContext.Err() != nil {
+			statusCode = http.StatusServiceUnavailable
+		}
+
+		http.Error(w, "Could not establish the configured outbound route", statusCode)
+		bridge.EmitError(fmt.Sprintf(
+			"Could not establish the outbound route to %s:%s: %v",
+			host,
+			port,
+			err,
+		))
+		return
+	}
+	if !config.connections.add(outboundConn) {
+		http.Error(w, "The proxy is stopping", http.StatusServiceUnavailable)
+		return
+	}
+	defer config.connections.remove(outboundConn)
+	defer outboundConn.Close()
+
 	// #8 Ejecutamos Hijack(), para obtener el Socket a la Conexion TCP
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		bridge.EmitError("Could not obtain the TCP connection")
 		return
 	}
-	defer clientConn.Close()
-
-	// #8 Contestamos con 200 OK simulando haber abierto un tunel ya con el servidor destino, pero en realidad el cliente va a negociar el TLS con nosotros
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	host, port, err := net.SplitHostPort(r.Host) // Host y Port del Servidor Destino
-	if err != nil {
-		bridge.EmitError(fmt.Sprintf("Could not get the host or port from the client connection: %v", err))
+	if !config.connections.add(clientConn) {
 		return
 	}
+	defer config.connections.remove(clientConn)
+	defer clientConn.Close()
 
-	// #8 Generamos un Certificado de TLS asociado al dominio y firmado por nuestro CA
-	certTLS, err := GenFakeCertSignedByCA(host, currentCACert, currentCAPrivKey)
-	if err != nil {
-		bridge.EmitError(fmt.Sprintf("Could not generate certificate for %s:%s: %v", host, port, err))
+	// La ruta de salida ya está establecida. A partir del 200, el cliente
+	// negocia TLS con Marmota mientras Marmota negocia TLS con el destino.
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		bridge.EmitError(fmt.Sprintf("Could not acknowledge the CONNECT tunnel: %v", err))
 		return
 	}
 
@@ -164,7 +491,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	// #8 - Cada vez que llamamos a tlsConn.Write(), este encripta con TLS los bytes pasados como parametro y los escribe con clientConn.Write() en la conexion TCP
 
 	var serverTLSConn *tls.Conn
-	var dialErr error
 	var negotiatedProtocol string
 
 	clientTLSConfig := &tls.Config{
@@ -177,17 +503,31 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			// #8 Configuramos la conexión hacia el servidor usando los protocolos que el cliente pidió
 			serverTLSConfig := &tls.Config{
 				MinVersion:         tls.VersionTLS10,
-				InsecureSkipVerify: skipServerCertVerify,
+				InsecureSkipVerify: config.skipServerCertVerify,
+				ServerName:         host,
 
 				// #8 NextProtos debe contener la lista de los protocolos que nosotros soportamos
 				// #8 clientHello.SupportedProtos contiene la lista original de protocolos que soporta el cliente (ej: ["h2", "http/1.1"])
 				NextProtos: clientHello.SupportedProtos,
 			}
 
-			serverTLSConn, dialErr = tls.Dial("tcp", host+":"+port, serverTLSConfig)
-			if dialErr != nil {
+			serverTLSConn = tls.Client(outboundConn, serverTLSConfig)
+			serverHandshakeBaseContext, cancelServerHandshakeBase :=
+				contextBoundToProxyLifecycle(
+					config.lifecycleContext,
+					clientHello.Context(),
+				)
+			handshakeCtx, cancelHandshake := context.WithTimeout(
+				serverHandshakeBaseContext,
+				tlsHandshakeTimeout,
+			)
+			handshakeErr := serverTLSConn.HandshakeContext(handshakeCtx)
+			cancelHandshake()
+			cancelServerHandshakeBase()
+			if handshakeErr != nil {
+				serverTLSConn.Close()
 				// Si el servidor falla, devolvemos el error y el handshake del cliente también fallará
-				return nil, dialErr
+				return nil, handshakeErr
 			}
 
 			// #8 Protocolo que eligió finalmente el servidor
@@ -208,13 +548,25 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientTLSConn := tls.Server(clientConn, clientTLSConfig)
-	if err := clientTLSConn.Handshake(); err != nil {
-		// #8 Si el handshake con el cliente falla por lo que sea, pero ya habíamos abierto la conexión con el servidor, debemos cerrarla para no dejar conexiones fantasma.
-		if serverTLSConn != nil {
-			serverTLSConn.Close()
-		}
-
+	clientHandshakeBaseContext, cancelClientHandshakeBase :=
+		contextBoundToProxyLifecycle(config.lifecycleContext, r.Context())
+	clientHandshakeCtx, cancelClientHandshake := context.WithTimeout(
+		clientHandshakeBaseContext,
+		tlsHandshakeTimeout,
+	)
+	err = clientTLSConn.HandshakeContext(clientHandshakeCtx)
+	cancelClientHandshake()
+	cancelClientHandshakeBase()
+	if err != nil {
 		bridge.EmitError(fmt.Sprintf("TLS handshake failed with client or server %s:%s: %v", host, port, err))
+		return
+	}
+	if serverTLSConn == nil {
+		bridge.EmitError(fmt.Sprintf(
+			"TLS interception for %s:%s completed without an outbound TLS connection",
+			host,
+			port,
+		))
 		return
 	}
 
@@ -222,7 +574,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	defer serverTLSConn.Close()
 
 	switch negotiatedProtocol {
-	case "http/1.1":
+	case "", "http/1.1":
 		http1xHandler(host, port, clientTLSConn, serverTLSConn)
 	case "h2":
 		http2Handler(host, port, clientTLSConn, serverTLSConn)
@@ -237,7 +589,7 @@ func http1xHandler(host string, port string, clientConn net.Conn, serverConn net
 		// #6 Por lo que para la Request y Response, la leemos nosotros con nuestra función auxiliar ReadSanitizedHTTP
 
 		// #8 Leemos Request HTTP quitando los headers que corresponden al Proxy, pero manteniendo orden de headers, versiones, mayusculas y minusculas y todo (Esto no lo podría hacer http.ReadRequest)
-		rawRequest, startLineData, err := h1x.ReadSanitizedHTTP(clientConn, "")
+		rawRequest, requestStartLine, err := h1x.ReadSanitizedHTTP(clientConn, "")
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				// Cierre limpio la conexión TCP. No mas peticiones HTTP en esta Conexioón
@@ -253,34 +605,45 @@ func http1xHandler(host string, port string, clientConn net.Conn, serverConn net
 		}
 
 		id := newAtomicID()
+		requestReceivedAtMs := time.Now().UnixMilli()
 
-		go func() {
+		go func(
+			rawRequest []byte,
+			requestStartLine h1x.StartLineData,
+			id uint64,
+			receivedAtMs int64,
+		) {
 			headBlockStr, bodyStr, err := h1x.ParseRawRequest(rawRequest)
 			if err != nil {
-				bridge.EmitError(fmt.Sprintf("Could not parse the HTTP/1.1 raw request for the frontend. ID: %d. Error: %v", id, err))
-				return
+				var decodingErr *utils.ContentDecodingError
+				if !errors.As(err, &decodingErr) {
+					bridge.EmitError(fmt.Sprintf("Could not parse the HTTP/1.1 raw request for the frontend. ID: %d. Error: %v", id, err))
+					return
+				}
+				bridge.EmitError(fmt.Sprintf("Could not decode the HTTP/1.1 request body for inspection. ID: %d. Raw encoded data was preserved. Error: %v", id, err))
 			}
 			bridge.AddRequestToHistory(&bridge.HTTPRequestDetail{
 				ID:           id,
 				Host:         host,
 				Port:         port,
-				Version:      startLineData.Version,
-				Method:       startLineData.Method,
-				Path:         startLineData.Path,
+				Version:      requestStartLine.Version,
+				Method:       requestStartLine.Method,
+				Path:         requestStartLine.Path,
 				Scheme:       "https",
 				HeadBlockStr: headBlockStr,
 				BodyStr:      bodyStr,
 			})
 			bridge.EmitHTTPRequestSummary(bridge.HTTPRequestSummary{
-				ID:      id,
-				Host:    host,
-				Port:    port,
-				Version: startLineData.Version,
-				Method:  startLineData.Method,
-				Path:    startLineData.Path,
-				Scheme:  "https",
+				ID:           id,
+				Host:         host,
+				Port:         port,
+				Version:      requestStartLine.Version,
+				Method:       requestStartLine.Method,
+				Path:         requestStartLine.Path,
+				Scheme:       "https",
+				ReceivedAtMs: receivedAtMs,
 			})
-		}()
+		}(rawRequest, requestStartLine, id, requestReceivedAtMs)
 
 		// #8 Escribimos la Request Cruda en la Conexion del Servidor
 		if _, err := serverConn.Write(rawRequest); err != nil {
@@ -289,35 +652,65 @@ func http1xHandler(host string, port string, clientConn net.Conn, serverConn net
 		}
 
 		// #8 Leemos Response HTTP manteniendo orden de headers, versiones, mayusculas y minusculas y todo (Esto no lo podría hacer http.ReadResponse)
-		rawResponse, startLineData, err := h1x.ReadSanitizedHTTP(serverConn, startLineData.Method)
+		rawResponse, responseStartLine, err := h1x.ReadSanitizedHTTP(
+			serverConn,
+			requestStartLine.Method,
+		)
 		if err != nil {
 			bridge.EmitError(fmt.Sprintf("Could not read and parse the server response in HTTP/1.1: %v", err))
 			return
 		}
+		responseReceivedAtMs := time.Now().UnixMilli()
 
-		go func() {
-			headBlockStr, bodyStr, err := h1x.ParseRawResponse(rawResponse, rawRequest)
+		go func(
+			rawResponse []byte,
+			rawRequest []byte,
+			responseStartLine h1x.StartLineData,
+			id uint64,
+			receivedAtMs int64,
+		) {
+			headBlockStr, bodyStr, contentEncoding, err :=
+				h1x.ParseRawResponseWithContentEncoding(rawResponse, rawRequest)
+			contentDecodingFailed := false
 			if err != nil {
-				bridge.EmitError(fmt.Sprintf("Could not parse the HTTP/1.1 raw response for the frontend. ID: %d. Error: %v", id, err))
-				return
+				var decodingErr *utils.ContentDecodingError
+				if !errors.As(err, &decodingErr) {
+					bridge.EmitError(fmt.Sprintf("Could not parse the HTTP/1.1 raw response for the frontend. ID: %d. Error: %v", id, err))
+					return
+				}
+				contentDecodingFailed = true
+				bridge.EmitError(fmt.Sprintf("Could not decode the HTTP/1.1 response body for inspection. ID: %d. Raw encoded data was preserved. Error: %v", id, err))
 			}
+			unsupportedContentEncodings :=
+				utils.UnsupportedContentEncodings(contentEncoding)
 			bridge.AddResponseToHistory(&bridge.HTTPResponseDetail{
-				ID:           id,
-				Host:         host,
-				Port:         port,
-				Version:      startLineData.Version,
-				StatusCode:   startLineData.StatusCode,
-				HeadBlockStr: headBlockStr,
-				BodyStr:      bodyStr,
+				ID:                          id,
+				Host:                        host,
+				Port:                        port,
+				Version:                     responseStartLine.Version,
+				StatusCode:                  responseStartLine.StatusCode,
+				HeadBlockStr:                headBlockStr,
+				BodyStr:                     bodyStr,
+				UnsupportedContentEncodings: unsupportedContentEncodings,
+				ContentDecodingFailed:       contentDecodingFailed,
 			})
 			bridge.EmitHTTPResponseSummary(bridge.HTTPResponseSummary{
-				ID:         id,
-				Host:       host,
-				Port:       port,
-				Version:    startLineData.Version,
-				StatusCode: startLineData.StatusCode,
+				ID:                          id,
+				Host:                        host,
+				Port:                        port,
+				Version:                     responseStartLine.Version,
+				StatusCode:                  responseStartLine.StatusCode,
+				ReceivedAtMs:                receivedAtMs,
+				UnsupportedContentEncodings: unsupportedContentEncodings,
+				ContentDecodingFailed:       contentDecodingFailed,
 			})
-		}()
+		}(
+			rawResponse,
+			rawRequest,
+			responseStartLine,
+			id,
+			responseReceivedAtMs,
+		)
 
 		// #8 Escribimos la Request Cruda en la Conexion del Cliente
 		if _, err := clientConn.Write(rawResponse); err != nil {
@@ -363,8 +756,10 @@ func http2Handler(host string, port string, clientConn net.Conn, serverConn net.
 		err := h2.SniffH2Traffic(prClient, false, msgChan) // Analiza peticiones
 		if err != io.EOF {
 			bridge.EmitError(fmt.Sprintf("Could not analyze HTTP/2 requests: %v", err))
-			return
 		}
+		// Inspection must never back-pressure or stop the proxied connection.
+		// If parsing fails, keep consuming the tee pipe until forwarding ends.
+		_, _ = io.Copy(io.Discard, prClient)
 	}()
 
 	go func() {
@@ -372,8 +767,8 @@ func http2Handler(host string, port string, clientConn net.Conn, serverConn net.
 		err := h2.SniffH2Traffic(prServer, true, msgChan) // Analiza respuestas
 		if err != io.EOF {
 			bridge.EmitError(fmt.Sprintf("Could not analyze HTTP/2 responses: %v", err))
-			return
 		}
+		_, _ = io.Copy(io.Discard, prServer)
 	}()
 
 	go func() {
@@ -381,26 +776,46 @@ func http2Handler(host string, port string, clientConn net.Conn, serverConn net.
 		close(msgChan)
 	}()
 
-	streamIDToInternalID := map[uint32]uint64{}
+	type capturedStream struct {
+		id               uint64
+		requestCaptured  bool
+		responseCaptured bool
+	}
+	capturedStreams := make(map[uint32]*capturedStream)
 
 	for msg := range msgChan {
 		if msg.Error != nil {
-			bridge.EmitError(fmt.Sprintf("Could not receive an HTTP/2 message: %v", msg.Error))
-			return
+			bridge.EmitError(fmt.Sprintf(
+				"Could not inspect HTTP/2 stream %d: %v",
+				msg.StreamID,
+				msg.Error,
+			))
+			delete(capturedStreams, msg.StreamID)
+			continue
+		}
+		if msg.DecodeError != nil {
+			bridge.EmitError(fmt.Sprintf(
+				"Could not decode the HTTP/2 body for inspection on stream %d. Raw encoded data was preserved. Error: %v",
+				msg.StreamID,
+				msg.DecodeError,
+			))
 		}
 
 		headBlockStr, err := h2.BuildHTTP1HeadBlockStr(&msg)
 		if err != nil {
 			bridge.EmitError(fmt.Sprintf("Could not build the Head Block string from an HTTP/2 message (isResponse: %t): %v", msg.IsResponse, err))
-			return
+			continue
+		}
+
+		stream := capturedStreams[msg.StreamID]
+		if stream == nil {
+			stream = &capturedStream{id: newAtomicID()}
+			capturedStreams[msg.StreamID] = stream
 		}
 
 		if !msg.IsResponse {
-			id := newAtomicID()
-			streamIDToInternalID[msg.StreamID] = id
-
 			bridge.AddRequestToHistory(&bridge.HTTPRequestDetail{
-				ID:           id,
+				ID:           stream.id,
 				Host:         host,
 				Port:         port,
 				Version:      "HTTP/2",
@@ -411,7 +826,7 @@ func http2Handler(host string, port string, clientConn net.Conn, serverConn net.
 				BodyStr:      msg.Body,
 			})
 			bridge.EmitHTTPRequestSummary(bridge.HTTPRequestSummary{
-				ID:           id,
+				ID:           stream.id,
 				Host:         host,
 				Port:         port,
 				Version:      "HTTP/2",
@@ -420,36 +835,46 @@ func http2Handler(host string, port string, clientConn net.Conn, serverConn net.
 				Scheme:       "https",
 				ReceivedAtMs: time.Now().UnixMilli(),
 			})
+			stream.requestCaptured = true
 		} else {
-			id, ok := streamIDToInternalID[msg.StreamID]
-			if !ok {
-				bridge.EmitError(fmt.Sprintf("streamIDToInternalID[%d] was not found while receiving the HTTP/2 response", msg.StreamID))
-				return
-			}
-
 			statusCode, err := strconv.Atoi(msg.Status)
 			if err != nil {
-				bridge.EmitError("Could not parse msg.Status as int")
-				return
+				bridge.EmitError(fmt.Sprintf(
+					"Could not parse HTTP/2 status %q on stream %d",
+					msg.Status,
+					msg.StreamID,
+				))
+				continue
 			}
 
+			unsupportedContentEncodings :=
+				utils.UnsupportedContentEncodings(msg.ContentEncoding)
 			bridge.AddResponseToHistory(&bridge.HTTPResponseDetail{
-				ID:           id,
-				Host:         host,
-				Port:         port,
-				Version:      "HTTP/2",
-				StatusCode:   statusCode,
-				HeadBlockStr: headBlockStr,
-				BodyStr:      msg.Body,
+				ID:                          stream.id,
+				Host:                        host,
+				Port:                        port,
+				Version:                     "HTTP/2",
+				StatusCode:                  statusCode,
+				HeadBlockStr:                headBlockStr,
+				BodyStr:                     msg.Body,
+				UnsupportedContentEncodings: unsupportedContentEncodings,
+				ContentDecodingFailed:       msg.DecodeError != nil,
 			})
 			bridge.EmitHTTPResponseSummary(bridge.HTTPResponseSummary{
-				ID:           id,
-				Host:         host,
-				Port:         port,
-				Version:      "HTTP/2",
-				StatusCode:   statusCode,
-				ReceivedAtMs: time.Now().UnixMilli(),
+				ID:                          stream.id,
+				Host:                        host,
+				Port:                        port,
+				Version:                     "HTTP/2",
+				StatusCode:                  statusCode,
+				ReceivedAtMs:                time.Now().UnixMilli(),
+				UnsupportedContentEncodings: unsupportedContentEncodings,
+				ContentDecodingFailed:       msg.DecodeError != nil,
 			})
+			stream.responseCaptured = true
+		}
+
+		if stream.requestCaptured && stream.responseCaptured {
+			delete(capturedStreams, msg.StreamID)
 		}
 	}
 }

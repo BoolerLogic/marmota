@@ -1,4 +1,5 @@
 <script lang="ts">
+    import HtmlRenderDialog from "./HtmlRenderDialog.svelte";
     import HtmlPrettyViewer from "./HtmlPrettyViewer.svelte";
     import JsonTreeNode from "./JsonTreeNode.svelte";
     import MultipartPrettyViewer from "./MultipartPrettyViewer.svelte";
@@ -43,14 +44,18 @@
     export let emptyLabel: string = "";
     export let searchQuery: string = "";
     export let matchCount: number = 0;
+    export let allowHtmlRender: boolean = false;
+    export let bodyIsEncoded: boolean = false;
 
     let activeView: ViewMode = "raw";
+    let htmlPreviewOpen = false;
     let lastSignature = "";
 
     function resolvePrettyBody(
         rawHeaders: string,
         rawBody: string,
     ): PrettyBody | null {
+        if (bodyIsEncoded) return null;
         if (rawBody.trim().length === 0) return null;
 
         const contentType = normalizeContentType(
@@ -145,9 +150,10 @@
             ? prettySearchText
             : normalizedBody;
     $: matchCount = countMatches(displayedSearchText, searchQuery);
-    $: signature = `${headBlockStr}__${normalizedBody}`;
+    $: signature = `${headBlockStr}__${normalizedBody}__${bodyIsEncoded}__${allowHtmlRender}`;
     $: if (signature !== lastSignature) {
         lastSignature = signature;
+        htmlPreviewOpen = false;
         activeView = hasPretty ? "pretty" : "raw";
     }
 </script>
@@ -171,6 +177,16 @@
             >
                 Raw
             </button>
+            {#if allowHtmlRender && prettyBody?.kind === "html"}
+                <button
+                    type="button"
+                    class="viewerTab renderTab"
+                    aria-haspopup="dialog"
+                    on:click={() => (htmlPreviewOpen = true)}
+                >
+                    Render
+                </button>
+            {/if}
         </div>
     {/if}
 
@@ -232,6 +248,13 @@
     {/if}
 </div>
 
+{#if htmlPreviewOpen && allowHtmlRender && prettyBody?.kind === "html"}
+    <HtmlRenderDialog
+        htmlText={prettyBody.html}
+        on:close={() => (htmlPreviewOpen = false)}
+    />
+{/if}
+
 <style>
     .bodyViewer {
         display: grid;
@@ -266,6 +289,17 @@
         color: var(--text);
         background: var(--accent-soft);
         border-color: var(--accent);
+    }
+
+    .viewerTab.renderTab {
+        color: var(--text);
+        border-color: rgba(var(--accent-rgb), 0.42);
+        background: rgba(var(--accent-rgb), 0.1);
+    }
+
+    .viewerTab.renderTab:hover {
+        border-color: var(--accent);
+        background: var(--accent-soft);
     }
 
     .prettyPanel {

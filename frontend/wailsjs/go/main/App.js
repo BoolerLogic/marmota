@@ -22,6 +22,14 @@ export function GetHistoryFilterMatchesForEntries(arg1) {
   return window['go']['main']['App']['GetHistoryFilterMatchesForEntries'](arg1);
 }
 
+export function GetInitialAppState() {
+  return window['go']['main']['App']['GetInitialAppState']();
+}
+
+export function OpenConfigDirectory() {
+  return window['go']['main']['App']['OpenConfigDirectory']();
+}
+
 export function RemoveActiveHistoryFilter(arg1) {
   return window['go']['main']['App']['RemoveActiveHistoryFilter'](arg1);
 }
@@ -38,8 +46,8 @@ export function SendRepeaterRequest(arg1) {
   return window['go']['main']['App']['SendRepeaterRequest'](arg1);
 }
 
-export function StartProxy(arg1, arg2, arg3) {
-  return window['go']['main']['App']['StartProxy'](arg1, arg2, arg3);
+export function StartProxy(arg1) {
+  return window['go']['main']['App']['StartProxy'](arg1);
 }
 
 export function UpsertActiveHistoryFilter(arg1) {

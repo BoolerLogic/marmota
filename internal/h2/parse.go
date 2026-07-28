@@ -17,15 +17,17 @@ import (
 
 // HTTP2Message ahora incluye campos explícitos para los metadatos de enrutamiento (Punto 3)
 type HTTP2Message struct {
-	StreamID   uint32
-	IsResponse bool
-	Method     string // Extraído de :method
-	Path       string // Extraído de :path
-	Authority  string // Extraído de :authority
-	Status     string // Extraído de :status
-	Headers    map[string]string
-	Body       string
-	Error      error // Para notificar si el stream se interrumpió abruptamente
+	StreamID        uint32
+	IsResponse      bool
+	Method          string // Extraído de :method
+	Path            string // Extraído de :path
+	Authority       string // Extraído de :authority
+	Status          string // Extraído de :status
+	Headers         map[string]string
+	Body            string
+	ContentEncoding string
+	DecodeError     error // Fallo de inspección; no debe interrumpir el tráfico.
+	Error           error // Para notificar si el stream se interrumpió abruptamente
 }
 
 type streamState struct {
@@ -68,18 +70,23 @@ func SniffH2Traffic(r io.Reader, isResponse bool, outChan chan<- HTTP2Message) e
 	defer func() {
 
 		for id, state := range streams {
-			body, _ := utils.ExtractAndDecompressBodyHTTP(state.ContentEncoding, state.Body)
+			body, decodeErr := utils.ExtractAndDecompressBodyHTTP(
+				state.ContentEncoding,
+				state.Body,
+			)
 
 			outChan <- HTTP2Message{
-				StreamID:   id,
-				IsResponse: isResponse,
-				Method:     state.Method,
-				Path:       state.Path,
-				Authority:  state.Authority,
-				Status:     state.Status,
-				Headers:    state.Headers,
-				Body:       body,
-				Error:      io.ErrUnexpectedEOF,
+				StreamID:        id,
+				IsResponse:      isResponse,
+				Method:          state.Method,
+				Path:            state.Path,
+				Authority:       state.Authority,
+				Status:          state.Status,
+				Headers:         state.Headers,
+				Body:            body,
+				ContentEncoding: state.ContentEncoding,
+				DecodeError:     decodeErr,
+				Error:           io.ErrUnexpectedEOF,
 			}
 		}
 	}()
@@ -106,9 +113,17 @@ func SniffH2Traffic(r io.Reader, isResponse bool, outChan chan<- HTTP2Message) e
 		} else {
 			// Cabeceras regulares se añaden al map manteniendo casing
 			if strings.EqualFold(f.Name, "Content-Encoding") {
-				s.ContentEncoding = f.Value
+				if s.ContentEncoding == "" {
+					s.ContentEncoding = f.Value
+				} else {
+					s.ContentEncoding += "," + f.Value
+				}
+				s.Headers[f.Name] = s.ContentEncoding
+			} else if _, exists := s.Headers[f.Name]; !exists {
+				// Match HTTP/1 inspection semantics for malformed duplicate
+				// singleton headers such as Content-Type: the first value wins.
+				s.Headers[f.Name] = f.Value
 			}
-			s.Headers[f.Name] = f.Value
 		}
 	})
 
@@ -171,13 +186,13 @@ func SniffH2Traffic(r io.Reader, isResponse bool, outChan chan<- HTTP2Message) e
 			}
 			if f.HeadersEnded() {
 				hpackDec.Close() // <--- ¡AQUÍ TAMBIÉN!
-				if state.EndStreamSeen {
+				if state != nil && state.EndStreamSeen {
 					readyToEmit = true
 				}
 			}
 
 		case *http2.DataFrame:
-			_, err := state.Body.Write(f.Data())
+			_, err := writeBoundedBodyCapture(state.Body, f.Data())
 			if err != nil {
 				return fmt.Errorf("write body error on stream %d: %w", streamID, err)
 			}
@@ -200,25 +215,45 @@ func SniffH2Traffic(r io.Reader, isResponse bool, outChan chan<- HTTP2Message) e
 		}
 
 		if readyToEmit {
-			body, err := utils.ExtractAndDecompressBodyHTTP(state.ContentEncoding, state.Body)
-			if err != nil {
-				return fmt.Errorf("error extracting and decompressing the body: %w", err)
-			}
+			body, decodeErr := utils.ExtractAndDecompressBodyHTTP(
+				state.ContentEncoding,
+				state.Body,
+			)
 
 			outChan <- HTTP2Message{
-				StreamID:   streamID,
-				IsResponse: isResponse,
-				Method:     state.Method,
-				Path:       state.Path,
-				Authority:  state.Authority,
-				Status:     state.Status,
-				Headers:    state.Headers,
-				Body:       body,
-				Error:      state.Error,
+				StreamID:        streamID,
+				IsResponse:      isResponse,
+				Method:          state.Method,
+				Path:            state.Path,
+				Authority:       state.Authority,
+				Status:          state.Status,
+				Headers:         state.Headers,
+				Body:            body,
+				ContentEncoding: state.ContentEncoding,
+				DecodeError:     decodeErr,
+				Error:           state.Error,
 			}
 			delete(streams, streamID) // Borramos este stream del Map una vez emitido por el canal
 		}
 	}
+}
+
+func writeBoundedBodyCapture(body *bytes.Buffer, data []byte) (int, error) {
+	const captureLimit = utils.MaxEncodedBodySize + 1
+
+	remaining := captureLimit - body.Len()
+	if remaining <= 0 {
+		return len(data), nil
+	}
+
+	originalLength := len(data)
+	if originalLength > remaining {
+		data = data[:remaining]
+	}
+	if _, err := body.Write(data); err != nil {
+		return 0, err
+	}
+	return originalLength, nil
 }
 
 func BuildHTTP1HeadBlockStr(msg *HTTP2Message) (string, error) {

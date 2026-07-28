@@ -26,6 +26,8 @@ export type RepeaterTabResponse = {
     version: string;
     statusCode: number | null;
     durationMs: number | null;
+    unsupportedContentEncodings: string[];
+    contentDecodingFailed: boolean;
 };
 
 export type RepeaterTab = {
@@ -79,6 +81,17 @@ function getNumberValue(
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function normalizeStringArray(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+
+    const normalized = value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim().toLowerCase())
+        .filter(Boolean);
+
+    return [...new Set(normalized)];
+}
+
 function buildRepeaterResponse(result: RepeaterSendResult): RepeaterTabResponse {
     const headBlockStr = getStringValue(result.headBlockStr);
     const bodyStr = getStringValue(result.bodyStr);
@@ -92,6 +105,10 @@ function buildRepeaterResponse(result: RepeaterSendResult): RepeaterTabResponse 
         version: getStringValue(result.version, parsedStartLine.version),
         statusCode: getNumberValue(result.statusCode, parsedStartLine.statusCode),
         durationMs: getNumberValue(result.durationMs),
+        unsupportedContentEncodings: normalizeStringArray(
+            result.unsupportedContentEncodings,
+        ),
+        contentDecodingFailed: result.contentDecodingFailed ?? false,
     };
 }
 

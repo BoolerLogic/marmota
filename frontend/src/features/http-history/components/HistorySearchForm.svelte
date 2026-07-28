@@ -5,6 +5,7 @@
     export let placeholder = "";
     export let progress = "0/0";
     export let compact = false;
+    export let singleLine = false;
     export let submitDisabled = false;
     export let navigateDisabled = false;
     export let previousLabel = "Go to previous match";
@@ -25,6 +26,7 @@
 <form
     class="searchForm"
     class:compact
+    class:singleLine
     on:submit|preventDefault={emitSubmit}
 >
     <input
@@ -204,6 +206,12 @@
     @media (max-width: 760px) {
         .searchForm.compact {
             align-items: stretch;
+        }
+    }
+
+    @media (min-width: 761px) {
+        .searchForm.singleLine {
+            flex-wrap: nowrap;
         }
     }
 </style>

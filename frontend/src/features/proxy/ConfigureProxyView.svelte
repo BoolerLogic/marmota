@@ -1,24 +1,48 @@
 <script lang="ts">
     import AppAlertDialog from "@/shared/components/AppAlertDialog.svelte";
     import ProxyStatusCard from "./components/ProxyStatusCard.svelte";
-    import type { ProxyMode, ProxyState } from "./utils/proxyUi";
-    import { isValidIP, isValidPort, resolveListenIp } from "./utils/proxyUi";
+    import type {
+        ProxyMode,
+        ProxyState,
+        UpstreamProxySettings,
+    } from "./utils/proxyUi";
+    import {
+        hasValidUpstreamProxyCredentials,
+        isValidIP,
+        isValidPort,
+        isValidUpstreamProxy,
+        isValidUpstreamProxyHost,
+        isValidUpstreamProxyPort,
+        resolveListenIp,
+    } from "./utils/proxyUi";
 
     export let error: string | null = null;
     export let onStartProxy: (
-        ip: string,
+        mode: ProxyMode,
+        specificIp: string,
         port: number,
         skipServerCertVerify: boolean,
+        upstreamProxy: UpstreamProxySettings,
     ) => Promise<void> | void;
     export let onCloseProxy: () => Promise<void> | void;
     export let onExportCA: () => Promise<string> | string;
     export let onResetCA: () => Promise<void> | void;
+    export let onOpenConfigDirectory: () => Promise<void> | void;
 
     export let state: ProxyState;
     export let proxyMode: ProxyMode;
     export let specificIp: string;
     export let port: number;
     export let skipServerCertVerify: boolean = false;
+    export let upstreamProxyEnabled: boolean = false;
+    export let upstreamProxyHost: string = "";
+    export let upstreamProxyPort: number = 1080;
+    export let upstreamProxyUsername: string = "";
+    export let upstreamProxyPassword: string = "";
+    export let configDirectory: string = "";
+    export let configFilePath: string = "";
+    export let configLoadWarning: string = "";
+    export let settingsReady: boolean = false;
 
     export let resolvedIp: string;
     export let portValid: boolean;
@@ -35,9 +59,15 @@
     let caMessageTone: "neutral" | "success" | "error" = "neutral";
     let resetConfirmDialogOpen = false;
     let resetSuccessDialogOpen = false;
+    let openingConfigDirectory = false;
+    let storageActionError = "";
 
     $: operationBusy = operationState !== "idle";
-    $: locked = state === "loading" || state === "running" || operationBusy;
+    $: locked =
+        !settingsReady ||
+        state === "loading" ||
+        state === "running" ||
+        operationBusy;
     $: exportBusy = operationState === "exporting";
     $: resetBusy = operationState === "resetting";
     $: startBusy = operationState === "starting";
@@ -45,9 +75,31 @@
     $: resolvedIp = resolveListenIp(proxyMode, specificIp);
     $: ipValid = isValidIP(resolvedIp);
     $: portValid = isValidPort(port);
+    $: upstreamProxySettings = {
+        enabled: upstreamProxyEnabled,
+        host: upstreamProxyHost,
+        port: upstreamProxyPort,
+        username: upstreamProxyUsername,
+        password: upstreamProxyPassword,
+    } satisfies UpstreamProxySettings;
+    $: upstreamProxyHostValid =
+        !upstreamProxyEnabled ||
+        isValidUpstreamProxyHost(upstreamProxyHost);
+    $: upstreamProxyPortValid =
+        !upstreamProxyEnabled ||
+        isValidUpstreamProxyPort(upstreamProxyPort);
+    $: upstreamProxyCredentialsValid =
+        !upstreamProxyEnabled ||
+        hasValidUpstreamProxyCredentials(
+            upstreamProxyUsername,
+            upstreamProxyPassword,
+        );
+    $: upstreamProxyValid = isValidUpstreamProxy(upstreamProxySettings);
     $: canStart =
+        settingsReady &&
         ipValid &&
         portValid &&
+        upstreamProxyValid &&
         !operationBusy &&
         state !== "loading" &&
         state !== "running";
@@ -80,6 +132,17 @@
     $: tlsHelper = skipServerCertVerify
         ? "Server TLS verification will be skipped"
         : "The server TLS certificate will be verified";
+    $: upstreamHostHelper = upstreamProxyHostValid
+        ? "Hostname or IP address"
+        : "A valid SOCKS5 hostname or IP is required";
+    $: upstreamPortHelper = upstreamProxyPortValid
+        ? "Valid SOCKS5 port"
+        : "Port must be between 1 and 65535";
+    $: upstreamCredentialsHelper = upstreamProxyCredentialsValid
+        ? upstreamProxyUsername.length > 0
+            ? "Credentials will be supplied if the SOCKS5 server requests authentication"
+            : "Leave both fields empty when authentication is not required"
+        : "Username and password must either both be filled in or both be empty";
 
     async function handleStart() {
         if (!canStart) return;
@@ -87,7 +150,13 @@
 
         operationState = "starting";
         try {
-            await onStartProxy(resolvedIp, port, skipServerCertVerify);
+            await onStartProxy(
+                proxyMode,
+                specificIp,
+                port,
+                skipServerCertVerify,
+                upstreamProxySettings,
+            );
         } finally {
             operationState = "idle";
         }
@@ -101,6 +170,23 @@
             await onCloseProxy();
         } finally {
             operationState = "idle";
+        }
+    }
+
+    async function handleOpenConfigDirectory() {
+        if (openingConfigDirectory || !configDirectory) return;
+
+        openingConfigDirectory = true;
+        storageActionError = "";
+        try {
+            await onOpenConfigDirectory();
+        } catch (error: unknown) {
+            storageActionError =
+                error instanceof Error
+                    ? error.message
+                    : "Could not open the Marmota configuration directory.";
+        } finally {
+            openingConfigDirectory = false;
         }
     }
 
@@ -200,6 +286,9 @@
             <span class="metaPill"
                 >TLS: {skipServerCertVerify ? "Skipped" : "Verified"}</span
             >
+            <span class="metaPill">
+                Outbound: {upstreamProxyEnabled ? "SOCKS5" : "Direct"}
+            </span>
         </div>
     </div>
 
@@ -280,6 +369,112 @@
                 </div>
             </label>
 
+            <section class="upstreamSection" aria-labelledby="upstream-title">
+                <div class="upstreamHeader">
+                    <div class="upstreamCopy">
+                        <span class="eyebrow">Outbound Route</span>
+                        <h3 id="upstream-title">SOCKS5 upstream proxy</h3>
+                        <p>
+                            When enabled, Marmota routes every intercepted
+                            outbound connection through this SOCKS5 proxy
+                            instead of connecting from this machine directly.
+                            TLS interception remains local to Marmota.
+                        </p>
+                    </div>
+
+                    <label class="enableToggle">
+                        <input
+                            class="checkInput"
+                            type="checkbox"
+                            bind:checked={upstreamProxyEnabled}
+                            disabled={locked}
+                        />
+                        <span>{upstreamProxyEnabled ? "Enabled" : "Disabled"}</span>
+                    </label>
+                </div>
+
+                {#if upstreamProxyEnabled}
+                    <div class="upstreamFields">
+                        <label class="fieldCard">
+                            <span class="fieldLabel">Host</span>
+                            <input
+                                class="input"
+                                class:invalid={!upstreamProxyHostValid}
+                                type="text"
+                                bind:value={upstreamProxyHost}
+                                placeholder="e.g. brd.superproxy.io"
+                                autocomplete="off"
+                                spellcheck="false"
+                                disabled={locked}
+                            />
+                            <span class="fieldHint">{upstreamHostHelper}</span>
+                        </label>
+
+                        <label class="fieldCard">
+                            <span class="fieldLabel">Port</span>
+                            <input
+                                class="input"
+                                class:invalid={!upstreamProxyPortValid}
+                                type="number"
+                                min="1"
+                                max="65535"
+                                step="1"
+                                bind:value={upstreamProxyPort}
+                                placeholder="e.g. 1080"
+                                disabled={locked}
+                            />
+                            <span class="fieldHint">{upstreamPortHelper}</span>
+                        </label>
+
+                        <label class="fieldCard">
+                            <span class="fieldLabel">Username (optional)</span>
+                            <input
+                                class="input"
+                                class:invalid={!upstreamProxyCredentialsValid}
+                                type="text"
+                                bind:value={upstreamProxyUsername}
+                                placeholder="SOCKS5 username"
+                                autocomplete="off"
+                                spellcheck="false"
+                                disabled={locked}
+                            />
+                        </label>
+
+                        <label class="fieldCard">
+                            <span class="fieldLabel">Password (optional)</span>
+                            <input
+                                class="input"
+                                class:invalid={!upstreamProxyCredentialsValid}
+                                type="text"
+                                bind:value={upstreamProxyPassword}
+                                placeholder="SOCKS5 password"
+                                autocomplete="off"
+                                disabled={locked}
+                            />
+                        </label>
+                    </div>
+
+                    <span
+                        class:invalidHint={!upstreamProxyCredentialsValid}
+                        class="credentialsHint"
+                    >
+                        {upstreamCredentialsHelper}
+                    </span>
+
+                    {#if proxyMode !== "local"}
+                        <div class="networkExposureWarning" role="alert">
+                            <strong>Protect this listener</strong>
+                            <span>
+                                Marmota does not authenticate inbound proxy
+                                clients. Binding outside localhost can let other
+                                devices use this upstream route. Restrict access
+                                with a firewall and a trusted network.
+                            </span>
+                        </div>
+                    {/if}
+                {/if}
+            </section>
+
             {#if state === "error"}
                 <div class="errorBox" role="alert">
                     <strong>Startup error</strong>
@@ -315,6 +510,9 @@
                 {port}
                 {state}
                 {skipServerCertVerify}
+                {upstreamProxyEnabled}
+                {upstreamProxyHost}
+                {upstreamProxyPort}
             />
 
             <section class="certificateCard">
@@ -367,6 +565,54 @@
             </section>
         </aside>
     </div>
+
+    <section class="storageNotice" aria-labelledby="storage-notice-title">
+        <div class="storageIcon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+                <path d="M3.5 6.5h6l2 2h9v9.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2V6.5Z" />
+                <path d="M3.5 10h17" />
+            </svg>
+        </div>
+
+        <div class="storageCopy">
+            <span class="eyebrow">Local storage</span>
+            <h3 id="storage-notice-title">
+                Marmota configuration and certificate files are stored in
+            </h3>
+            <button
+                type="button"
+                class="storagePath"
+                on:click={handleOpenConfigDirectory}
+                disabled={!configDirectory || openingConfigDirectory}
+                title={configDirectory
+                    ? `Open ${configDirectory}`
+                    : "Loading configuration directory"}
+            >
+                <span class="storagePathText">
+                    {configDirectory || "Loading configuration directory..."}
+                </span>
+                <span class="storagePathAction">
+                    {openingConfigDirectory ? "Opening..." : "Open folder"}
+                </span>
+            </button>
+            {#if configFilePath}
+                <span class="storageFileHint">
+                    Proxy settings: {configFilePath}. Configured SOCKS5
+                    credentials are stored locally in this file.
+                </span>
+            {/if}
+            {#if configLoadWarning}
+                <span class="storageWarning" role="alert">
+                    {configLoadWarning}
+                </span>
+            {/if}
+            {#if storageActionError}
+                <span class="storageWarning" role="alert">
+                    {storageActionError}
+                </span>
+            {/if}
+        </div>
+    </section>
 </div>
 
 {#if resetConfirmDialogOpen}
@@ -458,7 +704,8 @@
     }
 
     .heroCard,
-    .formCard {
+    .formCard,
+    .storageNotice {
         border-radius: 16px;
         border: 1px solid var(--line);
         background: var(--surface-strong);
@@ -511,6 +758,99 @@
         letter-spacing: 0.04em;
     }
 
+    .storageNotice {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 14px;
+        align-items: start;
+        padding: 16px 18px;
+    }
+
+    .storageIcon {
+        width: 42px;
+        height: 42px;
+        display: inline-grid;
+        place-items: center;
+        border-radius: 12px;
+        border: 1px solid rgba(var(--accent-rgb), 0.35);
+        background: var(--accent-soft);
+        color: var(--accent);
+    }
+
+    .storageIcon svg {
+        width: 21px;
+        height: 21px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+    }
+
+    .storageCopy {
+        min-width: 0;
+        display: grid;
+        gap: 7px;
+    }
+
+    .storagePath {
+        appearance: none;
+        width: 100%;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: var(--field-bg);
+        color: var(--text);
+        cursor: pointer;
+        text-align: left;
+    }
+
+    .storagePath:hover:not(:disabled),
+    .storagePath:focus-visible {
+        border-color: rgba(var(--accent-rgb), 0.6);
+        box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.12);
+        outline: none;
+    }
+
+    .storagePath:disabled {
+        cursor: wait;
+        opacity: 0.72;
+    }
+
+    .storagePathText {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+            "Liberation Mono", "Courier New", monospace;
+        font-size: 12px;
+    }
+
+    .storagePathAction {
+        flex: 0 0 auto;
+        color: var(--accent);
+        font-size: 11px;
+        font-weight: 800;
+    }
+
+    .storageFileHint,
+    .storageWarning {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+    }
+
+    .storageWarning {
+        color: var(--warning);
+    }
+
     .contentGrid {
         display: grid;
         grid-template-columns: minmax(0, 1.35fr) minmax(280px, 360px);
@@ -551,6 +891,89 @@
         max-width: none;
     }
 
+    .upstreamSection {
+        display: grid;
+        gap: 16px;
+        margin-top: 14px;
+        padding: 16px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background:
+            linear-gradient(
+                135deg,
+                rgba(var(--accent-rgb), 0.08),
+                transparent 46%
+            ),
+            var(--surface-muted);
+    }
+
+    .upstreamHeader {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 18px;
+    }
+
+    .upstreamCopy {
+        display: grid;
+        gap: 7px;
+        max-width: 680px;
+    }
+
+    .upstreamCopy p {
+        max-width: 660px;
+        font-size: 13px;
+        line-height: 1.5;
+    }
+
+    .enableToggle {
+        flex: 0 0 auto;
+        min-height: 38px;
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        padding: 0 12px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: var(--field-bg);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+    }
+
+    .upstreamFields {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+    }
+
+    .credentialsHint {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+    }
+
+    .credentialsHint.invalidHint {
+        color: var(--warning);
+    }
+
+    .networkExposureWarning {
+        display: grid;
+        gap: 4px;
+        padding: 11px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--warning-line);
+        background: var(--warning-soft);
+        color: var(--warning);
+        font-size: 12px;
+        line-height: 1.45;
+    }
+
+    .networkExposureWarning strong {
+        color: var(--text);
+    }
+
     .fieldLabel {
         color: var(--text);
         font-size: 13px;
@@ -580,6 +1003,10 @@
     .input:focus {
         border-color: rgba(var(--accent-rgb), 0.42);
         box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.18);
+    }
+
+    .input.invalid {
+        border-color: var(--warning);
     }
 
     .input:disabled {
@@ -921,6 +1348,14 @@
         }
 
         .fieldGrid {
+            grid-template-columns: 1fr;
+        }
+
+        .upstreamHeader {
+            flex-direction: column;
+        }
+
+        .upstreamFields {
             grid-template-columns: 1fr;
         }
 

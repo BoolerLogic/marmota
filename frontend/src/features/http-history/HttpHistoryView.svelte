@@ -7,6 +7,7 @@
     import RequestCopySubmenu from "@/shared/components/RequestCopySubmenu.svelte";
     import HistoryMessageBlock from "./components/HistoryMessageBlock.svelte";
     import RequestPathSummary from "./components/RequestPathSummary.svelte";
+    import RequestUrlBar from "./components/RequestUrlBar.svelte";
     import HistorySearchForm from "./components/HistorySearchForm.svelte";
     import { openRepeaterTabFromRequestSnapshot } from "@/features/repeater/state/repeaterStore";
     import {
@@ -70,6 +71,7 @@
     } from "@/shared/utils/httpEntryTable";
     import {
         calculateVirtualizedRange,
+        clampVirtualizedScrollTop,
         DEFAULT_TABLE_OVERSCAN,
     } from "@/shared/utils/virtualizedTable";
     import {
@@ -205,7 +207,10 @@
     let saveRequestDialogState: SaveRequestDialogState | null = null;
     let alertDialogState: AlertDialogState | null = null;
     let confirmDialogState: ConfirmDialogState | null = null;
-    let restoredHistoryListScrollKey = "";
+    let synchronizedHistoryViewport: HTMLDivElement | null = null;
+    let synchronizedHistoryListStateKey = "";
+    let synchronizedHistoryListScrollKey = "";
+    let historyListScrollSyncToken = 0;
     let initializedPersistedFilters = false;
     let selectedEntryDetail: HistoryEntryDetail | null = null;
     let selectedEntryDetailSourceKey = "";
@@ -264,6 +269,7 @@
         visibleEntries.find((entry) => entry.id === history.selectedId) ??
         visibleEntries[0] ??
         null;
+    $: selectedRequestUrl = buildRequestUrl(selectedEntry?.request ?? null);
     $: completedCount = visibleEntries.filter(
         (entry) => entry.request !== null && entry.response !== null,
     ).length;
@@ -284,6 +290,11 @@
         activeHistoryTab.kind === "main" ? "Filter" : "Edit filter";
     $: historyColumns = buildColumnTemplate(allColumns, columnWidths);
     $: historyListScrollKey = `http-history:list:${activeHistoryTab.id}`;
+    $: historyListStateKey = [
+        historyListScrollKey,
+        activeHistoryTab.filterVersion,
+        visibleEntries.length,
+    ].join(":");
     $: visibleEntryRange = calculateVirtualizedRange({
         itemCount: visibleEntries.length,
         scrollTop: historyListScrollTop,
@@ -368,15 +379,43 @@
     }
     $: if (
         listViewport &&
-        historyListScrollKey !== restoredHistoryListScrollKey
+        (listViewport !== synchronizedHistoryViewport ||
+            historyListStateKey !== synchronizedHistoryListStateKey)
     ) {
-        restoredHistoryListScrollKey = historyListScrollKey;
+        const viewportToSynchronize = listViewport;
+        const scrollKeyToSynchronize = historyListScrollKey;
+        const shouldRestoreRememberedScroll =
+            viewportToSynchronize !== synchronizedHistoryViewport ||
+            scrollKeyToSynchronize !== synchronizedHistoryListScrollKey;
+        const requestedScrollTop = shouldRestoreRememberedScroll
+            ? getRememberedScrollPosition(scrollKeyToSynchronize)
+            : historyListScrollTop;
+        const scrollSyncToken = ++historyListScrollSyncToken;
+
+        synchronizedHistoryViewport = viewportToSynchronize;
+        synchronizedHistoryListStateKey = historyListStateKey;
+        synchronizedHistoryListScrollKey = scrollKeyToSynchronize;
 
         tick().then(() => {
-            if (!listViewport) return;
-            listViewport.scrollTop =
-                getRememberedScrollPosition(historyListScrollKey);
-            historyListScrollTop = listViewport.scrollTop;
+            if (
+                scrollSyncToken !== historyListScrollSyncToken ||
+                listViewport !== viewportToSynchronize ||
+                historyListScrollKey !== scrollKeyToSynchronize
+            ) {
+                return;
+            }
+
+            viewportToSynchronize.scrollTop =
+                clampVirtualizedScrollTop(
+                    requestedScrollTop,
+                    viewportToSynchronize.scrollHeight,
+                    viewportToSynchronize.clientHeight,
+                );
+            historyListScrollTop = viewportToSynchronize.scrollTop;
+            rememberScrollPosition(
+                scrollKeyToSynchronize,
+                historyListScrollTop,
+            );
             updateHistoryViewportMetrics();
         });
     }
@@ -470,6 +509,23 @@
         return buildResponseLine(entry.response);
     }
 
+    function hasResponseEncodingWarning(entry: HistoryEntry): boolean {
+        return (
+            (entry.response?.unsupportedContentEncodings.length ?? 0) > 0 ||
+            (entry.response?.contentDecodingFailed ?? false)
+        );
+    }
+
+    function getResponseEncodingWarningLabel(entry: HistoryEntry): string {
+        const unsupported =
+            entry.response?.unsupportedContentEncodings ?? [];
+        if (unsupported.length > 0) {
+            return `Unsupported response Content-Encoding: ${unsupported.join(", ")}`;
+        }
+
+        return "The response Content-Encoding could not be decoded";
+    }
+
     function getRequestTimeValue(entry: HistoryEntry): number {
         return entry.requestArrivedAtMs ?? entry.firstSeenAtMs;
     }
@@ -504,6 +560,14 @@
     }
 
     function activateHistoryTab(tabId: string) {
+        if (tabId === activeHistoryTab.id) return;
+
+        if (listViewport) {
+            rememberScrollPosition(
+                historyListScrollKey,
+                listViewport.scrollTop,
+            );
+        }
         activateHistoryViewTab(tabId);
     }
 
@@ -1318,6 +1382,7 @@
     }
 
     onDestroy(() => {
+        historyListScrollSyncToken += 1;
         historyViewportObserver?.disconnect();
         historyHeadObserver?.disconnect();
         clearSelectedEntryDetailLoadingTimer();
@@ -1569,6 +1634,20 @@
                                                 >
                                                     {getStatusLabel(entry)}
                                                 </span>
+                                                {#if hasResponseEncodingWarning(entry)}
+                                                    <span
+                                                        class="encodingWarningBadge"
+                                                        role="img"
+                                                        aria-label={getResponseEncodingWarningLabel(
+                                                            entry,
+                                                        )}
+                                                        title={getResponseEncodingWarningLabel(
+                                                            entry,
+                                                        )}
+                                                    >
+                                                        !
+                                                    </span>
+                                                {/if}
                                             </div>
                                         {/if}
                                     {/each}
@@ -1593,6 +1672,7 @@
                     bind:value={globalSearchInput}
                     placeholder="Search within request and response"
                     progress={globalSearchProgress}
+                    singleLine
                     submitDisabled={!selectedEntry}
                     navigateDisabled={!selectedEntry ||
                         appliedGlobalSearch.trim().length === 0 ||
@@ -1650,6 +1730,16 @@
                             path={selectedEntry.request?.path || "-"}
                         />
                     </div>
+
+                    <RequestUrlBar
+                        url={selectedRequestUrl}
+                        on:copyerror={() =>
+                            openAlertDialog(
+                                "Could not copy",
+                                "The system did not allow the request URL to be copied to the clipboard.",
+                                "HTTP History",
+                            )}
+                    />
 
                     {#if selectedEntryDetailState === "loading"}
                         <div class="detailSkeleton" aria-hidden="true">
@@ -1749,6 +1839,29 @@
                         <span>Port: {selectedEntry.response?.port || "-"}</span>
                     </div>
 
+                    {#if hasResponseEncodingWarning(selectedEntry)}
+                        <div class="encodingWarningNotice" role="status">
+                            <span class="encodingWarningIcon" aria-hidden="true"
+                                >!</span
+                            >
+                            <span>
+                                {#if (selectedEntry.response?.unsupportedContentEncodings.length ?? 0) > 0}
+                                    Marmota cannot decode the response
+                                    Content-Encoding
+                                    <strong>
+                                        {selectedEntry.response?.unsupportedContentEncodings.join(
+                                            ", ",
+                                        )}
+                                    </strong>
+                                    .
+                                {:else}
+                                    Marmota could not decode the response body.
+                                {/if}
+                                The captured body is shown as raw encoded data.
+                            </span>
+                        </div>
+                    {/if}
+
                     {#if selectedEntryDetailState === "loading"}
                         <div class="detailSkeleton" aria-hidden="true">
                             <div class="detailSkeletonHeader">
@@ -1812,6 +1925,13 @@
                                 ?.headBlockStr ?? ""}
                             bodyStr={selectedEntryDetail?.response?.bodyStr ??
                                 ""}
+                            allowHtmlRender={true}
+                            bodyIsEncoded={(selectedEntryDetail?.response
+                                ?.unsupportedContentEncodings.length ?? 0) >
+                                0 ||
+                                (selectedEntryDetail?.response
+                                    ?.contentDecodingFailed ??
+                                    false)}
                             searchQuery={responseBodyQuery}
                             emptyLabel={selectedEntryDetail?.response
                                 ? ""
@@ -2560,6 +2680,27 @@
 
     .statusCell {
         overflow: visible;
+        gap: 7px;
+    }
+
+    .encodingWarningBadge,
+    .encodingWarningIcon {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--warning-line);
+        background: var(--warning-soft);
+        color: var(--warning);
+        font-weight: 900;
+    }
+
+    .encodingWarningBadge {
+        width: 22px;
+        height: 22px;
+        border-radius: 7px;
+        font-size: 12px;
+        line-height: 1;
     }
 
     .statusBadge,
@@ -2746,6 +2887,34 @@
         font-size: 12px;
         line-height: 1.45;
         font-weight: 700;
+    }
+
+    .encodingWarningNotice {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        margin-bottom: 12px;
+        padding: 11px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--warning-line);
+        background: var(--warning-soft);
+        color: var(--warning);
+        font-size: 12px;
+        line-height: 1.5;
+    }
+
+    .encodingWarningNotice strong {
+        color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+            "Liberation Mono", "Courier New", monospace;
+    }
+
+    .encodingWarningIcon {
+        width: 24px;
+        height: 24px;
+        border-radius: 8px;
+        font-size: 13px;
+        line-height: 1;
     }
 
     .detailSkeleton {

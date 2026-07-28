@@ -3,6 +3,8 @@ module marmota
 go 1.24
 
 require (
+	github.com/andybalholm/brotli v1.2.0
+	github.com/klauspost/compress v1.18.4
 	github.com/wailsapp/wails/v2 v2.11.0
 	golang.org/x/net v0.43.0
 )

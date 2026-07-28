@@ -1,6 +1,9 @@
 package bridge
 
-import "sync"
+import (
+	"marmota/internal/utils"
+	"sync"
+)
 
 type HTTPRequestDetail struct {
 	ID            uint64 `json:"id"`
@@ -16,14 +19,16 @@ type HTTPRequestDetail struct {
 }
 
 type HTTPResponseDetail struct {
-	ID            uint64 `json:"id"`
-	Host          string `json:"host"`
-	Port          string `json:"port"`
-	HeadBlockStr  string `json:"headBlockStr"`
-	BodyStr       string `json:"bodyStr"`
-	TruncatedBody bool   `json:"truncatedBody"`
-	Version       string `json:"version"`
-	StatusCode    int    `json:"statusCode"`
+	ID                          uint64   `json:"id"`
+	Host                        string   `json:"host"`
+	Port                        string   `json:"port"`
+	HeadBlockStr                string   `json:"headBlockStr"`
+	BodyStr                     string   `json:"bodyStr"`
+	TruncatedBody               bool     `json:"truncatedBody"`
+	Version                     string   `json:"version"`
+	StatusCode                  int      `json:"statusCode"`
+	UnsupportedContentEncodings []string `json:"unsupportedContentEncodings"`
+	ContentDecodingFailed       bool     `json:"contentDecodingFailed"`
 }
 
 type HTTPHistoryEntryDetail struct {
@@ -32,26 +37,28 @@ type HTTPHistoryEntryDetail struct {
 	Response *HTTPResponseDetail `json:"response"`
 }
 
-var MAX_BODY_SIZE = 500 * 1024 // 500 KB
+const MAX_BODY_SIZE = utils.MaxCapturedBodySize
 
 var history = make(map[uint64]*HTTPHistoryEntryDetail, 300)
 var historyMu sync.RWMutex
 
 func AddRequestToHistory(req *HTTPRequestDetail) {
 	historyMu.Lock()
-	history[req.ID] = &HTTPHistoryEntryDetail{
-		ID:       req.ID,
-		Request:  req,
-		Response: nil,
+	entry, exists := history[req.ID]
+	if !exists {
+		entry = &HTTPHistoryEntryDetail{ID: req.ID}
+		history[req.ID] = entry
 	}
+	entry.Request = req
 	historyMu.Unlock()
 }
 
 func AddResponseToHistory(res *HTTPResponseDetail) {
 	historyMu.Lock()
-	entry, ok := history[res.ID]
-	if !ok {
-		panic(" > Received a response with an identifier that does not exist")
+	entry, exists := history[res.ID]
+	if !exists {
+		entry = &HTTPHistoryEntryDetail{ID: res.ID}
+		history[res.ID] = entry
 	}
 	entry.Response = res
 	historyMu.Unlock()
@@ -59,37 +66,54 @@ func AddResponseToHistory(res *HTTPResponseDetail) {
 
 func GetHistoryEntryDetail(id uint64) HTTPHistoryEntryDetail {
 	historyMu.RLock()
-	entry, ok := history[id]
-	if !ok {
-		panic(" > Could not find an HTTPHistoryEntryDetail in the history map")
+	entry, exists := history[id]
+	if !exists || entry == nil {
+		historyMu.RUnlock()
+		return HTTPHistoryEntryDetail{ID: id}
+	}
+
+	detail := HTTPHistoryEntryDetail{ID: entry.ID}
+	if entry.Request != nil {
+		requestCopy := *entry.Request
+		detail.Request = &requestCopy
+	}
+	if entry.Response != nil {
+		responseCopy := *entry.Response
+		responseCopy.UnsupportedContentEncodings = append(
+			[]string(nil),
+			entry.Response.UnsupportedContentEncodings...,
+		)
+		detail.Response = &responseCopy
 	}
 	historyMu.RUnlock()
 
-	if len(entry.Request.BodyStr) > MAX_BODY_SIZE {
-		entry.Request.BodyStr = entry.Request.BodyStr[:MAX_BODY_SIZE]
-		entry.Request.TruncatedBody = true
-	} else {
-		entry.Request.TruncatedBody = false
+	if detail.Request != nil {
+		detail.Request.BodyStr, detail.Request.TruncatedBody =
+			truncateHistoryBody(detail.Request.BodyStr)
+	}
+	if detail.Response != nil {
+		detail.Response.BodyStr, detail.Response.TruncatedBody =
+			truncateHistoryBody(detail.Response.BodyStr)
 	}
 
-	if len(entry.Response.BodyStr) > MAX_BODY_SIZE {
-		entry.Response.BodyStr = entry.Response.BodyStr[:MAX_BODY_SIZE]
-		entry.Response.TruncatedBody = true
-	} else {
-		entry.Response.TruncatedBody = false
-	}
+	return detail
+}
 
-	return *entry
+func truncateHistoryBody(body string) (string, bool) {
+	if len(body) <= MAX_BODY_SIZE {
+		return body, false
+	}
+	return body[:MAX_BODY_SIZE], true
 }
 
 func RemoveHistoryEntry(id uint64) {
 	historyMu.Lock()
-	_, exits := history[id]
-	if !exits {
+	defer historyMu.Unlock()
+
+	if _, exists := history[id]; !exists {
 		return
 	}
 	delete(history, id)
-	historyMu.Unlock()
 }
 
 func ClearHistoryEntries() {

@@ -2,17 +2,26 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	goruntime "runtime"
+	"sync"
+
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+
 	"marmota/internal/bridge"
 	"marmota/internal/proxy"
 	"marmota/internal/repeater"
-	"os"
-
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"marmota/internal/settings"
 )
 
 // App struct
 type App struct {
-	ctx context.Context
+	ctx          context.Context
+	settingsMu   sync.RWMutex
+	initialState settings.InitialAppState
 }
 
 // NewApp creates a new App application struct
@@ -25,6 +34,67 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	bridge.Init(ctx)
+
+	config, loadErr := settings.Load(settings.ConfigFilePath)
+	loadWarning := ""
+	if loadErr != nil {
+		loadWarning = fmt.Sprintf(
+			"Could not load %s. Marmota is using safe defaults. Error: %v",
+			settings.ConfigFilePath,
+			loadErr,
+		)
+	}
+
+	a.settingsMu.Lock()
+	a.initialState = settings.InitialAppState{
+		Config:            config,
+		ConfigDirectory:   proxy.CADirectory,
+		ConfigFilePath:    settings.ConfigFilePath,
+		CACertificatePath: proxy.CACertPath,
+		LoadWarning:       loadWarning,
+	}
+	a.settingsMu.Unlock()
+}
+
+func (a *App) shutdown(_ context.Context) {
+	if proxy.IsProxyActive() {
+		if err := proxy.CloseProxy(); err != nil {
+			log.Printf("Could not close the proxy during shutdown: %v", err)
+		}
+	}
+	bridge.Shutdown()
+}
+
+func (a *App) GetInitialAppState() settings.InitialAppState {
+	a.settingsMu.RLock()
+	defer a.settingsMu.RUnlock()
+	return a.initialState
+}
+
+func (a *App) OpenConfigDirectory() error {
+	if err := os.MkdirAll(proxy.CADirectory, 0700); err != nil {
+		return fmt.Errorf("create Marmota configuration directory: %w", err)
+	}
+
+	var command *exec.Cmd
+	switch goruntime.GOOS {
+	case "windows":
+		command = exec.Command("explorer.exe", proxy.CADirectory)
+	case "darwin":
+		command = exec.Command("open", proxy.CADirectory)
+	case "linux":
+		command = exec.Command("xdg-open", proxy.CADirectory)
+	default:
+		return fmt.Errorf(
+			"opening the configuration directory is not supported on %s",
+			goruntime.GOOS,
+		)
+	}
+
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("open Marmota configuration directory: %w", err)
+	}
+	return nil
 }
 
 func (a *App) ExportCA() (string, error) {
@@ -34,10 +104,10 @@ func (a *App) ExportCA() (string, error) {
 	}
 
 	// 1. Abrir el diálogo de guardado
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
 		Title:           "Export Marmota CA Certificate",
 		DefaultFilename: "marmota-ca.crt",
-		Filters: []runtime.FileFilter{
+		Filters: []wailsruntime.FileFilter{
 			{DisplayName: "Certificate (*.crt)", Pattern: "*.crt"},
 			{DisplayName: "PEM (*.pem)", Pattern: "*.pem"},
 		},
@@ -82,12 +152,23 @@ func (a *App) ResetCA() error {
 	return err
 }
 
-func (a *App) StartProxy(ip string, port uint16, skipServerCertVerify bool) error {
-	err := proxy.StartProxy(proxy.ConfigProxy{IP: ip, Port: port, SkipServerCertVerify: skipServerCertVerify})
+func (a *App) StartProxy(config settings.ProxyConfig) error {
+	normalized, err := settings.Save(settings.ConfigFilePath, config)
 	if err != nil {
 		return err
 	}
-	return nil
+
+	runtimeConfig, err := normalized.RuntimeConfig()
+	if err != nil {
+		return err
+	}
+
+	a.settingsMu.Lock()
+	a.initialState.Config = normalized
+	a.initialState.LoadWarning = ""
+	a.settingsMu.Unlock()
+
+	return proxy.StartProxy(runtimeConfig)
 }
 
 func (a *App) CloseProxy() error {

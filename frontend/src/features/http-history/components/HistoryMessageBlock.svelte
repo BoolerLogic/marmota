@@ -19,6 +19,8 @@
     export let nextLabel = "Go to next match";
     export let matchCount = 0;
     export let containerElement: HTMLDivElement | null = null;
+    export let allowHtmlRender = false;
+    export let bodyIsEncoded = false;
 
     const dispatch = createEventDispatcher<{
         submit: void;
@@ -38,6 +40,8 @@
                 {headBlockStr}
                 {bodyStr}
                 {emptyLabel}
+                {allowHtmlRender}
+                {bodyIsEncoded}
                 searchQuery={searchQuery}
                 bind:matchCount
             />

@@ -242,20 +242,17 @@ func GetHistoryFilterMatchesForEntries(params GetHistoryFilterMatchesForEntriesP
 
 func collectMatchingHistoryIDs(filter activeHistoryFilter) []uint64 {
 	historyMu.RLock()
-	entries := make([]*HTTPHistoryEntryDetail, 0, len(history))
-	for _, entry := range history {
-		if entry != nil {
-			entries = append(entries, entry)
-		}
-	}
-	historyMu.RUnlock()
+	defer historyMu.RUnlock()
 
-	if len(entries) == 0 {
+	if len(history) == 0 {
 		return []uint64{}
 	}
 
-	matchingIDs := make([]uint64, 0, len(entries))
-	for _, entry := range entries {
+	matchingIDs := make([]uint64, 0, len(history))
+	for _, entry := range history {
+		if entry == nil {
+			continue
+		}
 		// #8 "candidateCache" guarda en Cache los textos en minusculas y concatenados que usemos en una condicion. Para no tener que volver a procesarlos si lo usamos en otra condición.
 		candidateCache := make(map[HistoryFilterTarget]string, 4)
 		if entryMatchesCompiledHistoryFilters(entry, filter, candidateCache) {
@@ -288,7 +285,16 @@ func snapshotHistoryEntries(entryIDs []uint64) map[uint64]*HTTPHistoryEntryDetai
 	entries := make(map[uint64]*HTTPHistoryEntryDetail, len(entryIDs))
 	for _, entryID := range entryIDs {
 		if entry, exists := history[entryID]; exists && entry != nil {
-			entries[entryID] = entry
+			entryCopy := *entry
+			if entry.Request != nil {
+				requestCopy := *entry.Request
+				entryCopy.Request = &requestCopy
+			}
+			if entry.Response != nil {
+				responseCopy := *entry.Response
+				entryCopy.Response = &responseCopy
+			}
+			entries[entryID] = &entryCopy
 		}
 	}
 

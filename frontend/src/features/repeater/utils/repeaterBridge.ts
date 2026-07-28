@@ -27,6 +27,8 @@ export type RepeaterSendResult = {
     version?: string;
     statusCode?: number | null;
     durationMs?: number | null;
+    unsupportedContentEncodings?: string[];
+    contentDecodingFailed?: boolean;
 };
 
 type RepeaterWindow = Window & {

@@ -46,6 +46,24 @@
         </div>
     {:else if response}
         <div class="responseContent">
+            {#if response.unsupportedContentEncodings.length > 0 || response.contentDecodingFailed}
+                <div class="encodingWarningNotice" role="status">
+                    <span class="encodingWarningIcon" aria-hidden="true">!</span>
+                    <span>
+                        {#if response.unsupportedContentEncodings.length > 0}
+                            Marmota cannot decode the response Content-Encoding
+                            <strong>
+                                {response.unsupportedContentEncodings.join(", ")}
+                            </strong>
+                            .
+                        {:else}
+                            Marmota could not decode the response body.
+                        {/if}
+                        The captured body is shown as raw encoded data.
+                    </span>
+                </div>
+            {/if}
+
             <div class="responseBlock">
                 <div class="blockLabel">Head Block</div>
                 <HeadBlockViewer text={response.headBlockStr} />
@@ -56,6 +74,9 @@
                 <HttpBodyViewer
                     headBlockStr={response.headBlockStr}
                     bodyStr={response.bodyStr}
+                    allowHtmlRender={true}
+                    bodyIsEncoded={response.contentDecodingFailed ||
+                        response.unsupportedContentEncodings.length > 0}
                 />
             </div>
         </div>
@@ -124,6 +145,41 @@
     .responseContent {
         display: grid;
         gap: 14px;
+    }
+
+    .encodingWarningNotice {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 11px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--warning-line);
+        background: var(--warning-soft);
+        color: var(--warning);
+        font-size: 12px;
+        line-height: 1.5;
+    }
+
+    .encodingWarningNotice strong {
+        color: var(--text);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+            "Liberation Mono", "Courier New", monospace;
+    }
+
+    .encodingWarningIcon {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 8px;
+        border: 1px solid var(--warning-line);
+        background: var(--warning-soft);
+        color: var(--warning);
+        font-size: 13px;
+        font-weight: 900;
+        line-height: 1;
     }
 
     .responseBlock {

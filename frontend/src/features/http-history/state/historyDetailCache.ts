@@ -23,6 +23,8 @@ export type ResponseView = {
     truncatedBody?: boolean;
     version: string;
     statusCode: number | null;
+    unsupportedContentEncodings: string[];
+    contentDecodingFailed: boolean;
 };
 
 export type HistoryEntryDetail = {
@@ -35,6 +37,55 @@ export const HISTORY_DETAIL_CACHE_LIMIT = 30;
 
 const detailCache = new Map<string, HistoryEntryDetail>();
 const detailRequestsInFlight = new Map<string, Promise<HistoryEntryDetail>>();
+type PendingDetailRequestState = {
+    invalidated: boolean;
+    refreshAfterInvalidation: boolean;
+};
+const pendingDetailRequestStatesById = new Map<
+    string,
+    Set<PendingDetailRequestState>
+>();
+
+function registerPendingDetailRequest(
+    id: string,
+    requestState: PendingDetailRequestState,
+) {
+    const pendingRequestStates =
+        pendingDetailRequestStatesById.get(id) ??
+        new Set<PendingDetailRequestState>();
+    pendingRequestStates.add(requestState);
+    pendingDetailRequestStatesById.set(id, pendingRequestStates);
+}
+
+function unregisterPendingDetailRequest(
+    id: string,
+    requestState: PendingDetailRequestState,
+) {
+    const pendingRequestStates = pendingDetailRequestStatesById.get(id);
+    if (!pendingRequestStates) {
+        return;
+    }
+
+    pendingRequestStates.delete(requestState);
+    if (pendingRequestStates.size === 0) {
+        pendingDetailRequestStatesById.delete(id);
+    }
+}
+
+function invalidatePendingDetailRequests(
+    id: string,
+    refreshAfterInvalidation: boolean,
+) {
+    const pendingRequestStates = pendingDetailRequestStatesById.get(id);
+    if (!pendingRequestStates) {
+        return;
+    }
+
+    for (const requestState of pendingRequestStates) {
+        requestState.invalidated = true;
+        requestState.refreshAfterInvalidation = refreshAfterInvalidation;
+    }
+}
 
 function normalizeRequestDetail(
     payload: bridge.HTTPRequestDetail | null | undefined,
@@ -73,6 +124,18 @@ function normalizeResponseDetail(
         truncatedBody: payload.truncatedBody ?? false,
         version: payload.version ?? "",
         statusCode: payload.statusCode ?? null,
+        unsupportedContentEncodings: Array.isArray(
+            payload.unsupportedContentEncodings,
+        )
+            ? payload.unsupportedContentEncodings
+                  .filter(
+                      (value): value is string =>
+                          typeof value === "string",
+                  )
+                  .map((value) => value.trim().toLowerCase())
+                  .filter(Boolean)
+            : [],
+        contentDecodingFailed: payload.contentDecodingFailed ?? false,
     };
 }
 
@@ -87,6 +150,14 @@ function normalizeHistoryEntryDetail(
 }
 
 function setCachedHistoryEntryDetail(detail: HistoryEntryDetail) {
+    // An entry without either side is the backend's safe "not found" response.
+    // It may be observed by a request that raced with deletion, but it must not
+    // become a durable cache hit.
+    if (!detail.request && !detail.response) {
+        detailCache.delete(detail.id);
+        return;
+    }
+
     detailCache.delete(detail.id);
     detailCache.set(detail.id, detail);
 
@@ -125,16 +196,35 @@ export async function getHistoryEntryDetailCached(
         return currentRequest;
     }
 
-    const nextRequest = GetHistoryEntryDetail(toBackendHistoryId(id))
+    const requestState: PendingDetailRequestState = {
+        invalidated: false,
+        refreshAfterInvalidation: false,
+    };
+    const nextRequest: Promise<HistoryEntryDetail> = GetHistoryEntryDetail(
+        toBackendHistoryId(id),
+    )
         .then(normalizeHistoryEntryDetail)
         .then((detail) => {
+            if (requestState.invalidated) {
+                return requestState.refreshAfterInvalidation
+                    ? getHistoryEntryDetailCached(id)
+                    : detail;
+            }
+            if (detailRequestsInFlight.get(id) !== nextRequest) {
+                return detail;
+            }
+
             setCachedHistoryEntryDetail(detail);
             return detail;
         })
         .finally(() => {
-            detailRequestsInFlight.delete(id);
+            if (detailRequestsInFlight.get(id) === nextRequest) {
+                detailRequestsInFlight.delete(id);
+            }
+            unregisterPendingDetailRequest(id, requestState);
         });
 
+    registerPendingDetailRequest(id, requestState);
     detailRequestsInFlight.set(id, nextRequest);
     return nextRequest;
 }
@@ -144,13 +234,30 @@ export function cacheHistoryEntryDetail(detail: HistoryEntryDetail) {
 }
 
 export function invalidateHistoryEntryDetail(id: string) {
+    invalidatePendingDetailRequests(id, true);
+    detailCache.delete(id);
+    detailRequestsInFlight.delete(id);
+}
+
+export function removeHistoryEntryDetail(id: string) {
+    // Unlike an update invalidation, deletion must not make an older request
+    // issue a follow-up fetch for an entry that no longer exists.
+    invalidatePendingDetailRequests(id, false);
     detailCache.delete(id);
     detailRequestsInFlight.delete(id);
 }
 
 export function clearHistoryDetailCache() {
+    for (const pendingRequestStates of pendingDetailRequestStatesById.values()) {
+        for (const requestState of pendingRequestStates) {
+            requestState.invalidated = true;
+            requestState.refreshAfterInvalidation = false;
+        }
+    }
+
     detailCache.clear();
     detailRequestsInFlight.clear();
+    pendingDetailRequestStatesById.clear();
 }
 
 function toBackendHistoryId(id: string): number {

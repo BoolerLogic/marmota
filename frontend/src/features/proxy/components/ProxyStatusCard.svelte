@@ -6,6 +6,9 @@
     export let port: number;
     export let state: ProxyState;
     export let skipServerCertVerify: boolean = false;
+    export let upstreamProxyEnabled: boolean = false;
+    export let upstreamProxyHost: string = "";
+    export let upstreamProxyPort: number = 1080;
 
     $: statusLabel =
         state === "running"
@@ -37,6 +40,14 @@
             class={`tlsState ${skipServerCertVerify ? "relaxed" : "strict"}`}
             >{skipServerCertVerify ? "Skipped" : "Verified"}</strong
         >
+    </div>
+    <div class="snapshotRow">
+        <span>Outbound Route</span>
+        <strong class:upstream={upstreamProxyEnabled}>
+            {upstreamProxyEnabled
+                ? `SOCKS5 · ${upstreamProxyHost.trim() || "-"}:${upstreamProxyPort}`
+                : "Direct connection"}
+        </strong>
     </div>
 </div>
 
@@ -106,6 +117,10 @@
 
     .tlsState.relaxed {
         color: var(--warning);
+    }
+
+    .snapshotRow strong.upstream {
+        color: var(--info);
     }
 
     @media (max-width: 980px) {

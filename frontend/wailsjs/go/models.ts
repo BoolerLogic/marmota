@@ -21,6 +21,8 @@ export namespace bridge {
 	    truncatedBody: boolean;
 	    version: string;
 	    statusCode: number;
+	    unsupportedContentEncodings: string[];
+	    contentDecodingFailed: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new HTTPResponseDetail(source);
@@ -36,6 +38,8 @@ export namespace bridge {
 	        this.truncatedBody = source["truncatedBody"];
 	        this.version = source["version"];
 	        this.statusCode = source["statusCode"];
+	        this.unsupportedContentEncodings = source["unsupportedContentEncodings"];
+	        this.contentDecodingFailed = source["contentDecodingFailed"];
 	    }
 	}
 	export class HTTPRequestDetail {
@@ -236,6 +240,31 @@ export namespace bridge {
 
 }
 
+export namespace proxy {
+	
+	export class UpstreamProxyConfig {
+	    enabled: boolean;
+	    host: string;
+	    port: number;
+	    username: string;
+	    password: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpstreamProxyConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.host = source["host"];
+	        this.port = source["port"];
+	        this.username = source["username"];
+	        this.password = source["password"];
+	    }
+	}
+
+}
+
 export namespace repeater {
 	
 	export class RepeaterHttp2PseudoHeaders {
@@ -316,6 +345,8 @@ export namespace repeater {
 	    version?: string;
 	    statusCode?: number;
 	    durationMs?: number;
+	    unsupportedContentEncodings: string[];
+	    contentDecodingFailed: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new RepeaterSendResult(source);
@@ -330,7 +361,92 @@ export namespace repeater {
 	        this.version = source["version"];
 	        this.statusCode = source["statusCode"];
 	        this.durationMs = source["durationMs"];
+	        this.unsupportedContentEncodings = source["unsupportedContentEncodings"];
+	        this.contentDecodingFailed = source["contentDecodingFailed"];
 	    }
+	}
+
+}
+
+export namespace settings {
+	
+	export class ProxyConfig {
+	    schemaVersion: number;
+	    proxyMode: string;
+	    specificIp: string;
+	    port: number;
+	    skipServerCertVerify: boolean;
+	    upstreamProxy: proxy.UpstreamProxyConfig;
+	
+	    static createFrom(source: any = {}) {
+	        return new ProxyConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.schemaVersion = source["schemaVersion"];
+	        this.proxyMode = source["proxyMode"];
+	        this.specificIp = source["specificIp"];
+	        this.port = source["port"];
+	        this.skipServerCertVerify = source["skipServerCertVerify"];
+	        this.upstreamProxy = this.convertValues(source["upstreamProxy"], proxy.UpstreamProxyConfig);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class InitialAppState {
+	    config: ProxyConfig;
+	    configDirectory: string;
+	    configFilePath: string;
+	    caCertificatePath: string;
+	    loadWarning: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new InitialAppState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.config = this.convertValues(source["config"], ProxyConfig);
+	        this.configDirectory = source["configDirectory"];
+	        this.configFilePath = source["configFilePath"];
+	        this.caCertificatePath = source["caCertificatePath"];
+	        this.loadWarning = source["loadWarning"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }

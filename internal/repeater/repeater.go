@@ -3,11 +3,13 @@ package repeater
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"marmota/internal/bridge"
 	"marmota/internal/h1x"
 	"marmota/internal/h2"
+	"marmota/internal/utils"
 	"net"
 	"strconv"
 	"strings"
@@ -40,13 +42,15 @@ type RepeaterSendPayload struct {
 }
 
 type RepeaterSendResult struct {
-	HeadBlockStr string `json:"headBlockStr"`
-	BodyStr      string `json:"bodyStr"`
-	Host         string `json:"host,omitempty"`
-	Port         string `json:"port,omitempty"`
-	Version      string `json:"version,omitempty"`
-	StatusCode   *int   `json:"statusCode"`
-	DurationMs   *int64 `json:"durationMs"`
+	HeadBlockStr                string   `json:"headBlockStr"`
+	BodyStr                     string   `json:"bodyStr"`
+	Host                        string   `json:"host,omitempty"`
+	Port                        string   `json:"port,omitempty"`
+	Version                     string   `json:"version,omitempty"`
+	StatusCode                  *int     `json:"statusCode"`
+	DurationMs                  *int64   `json:"durationMs"`
+	UnsupportedContentEncodings []string `json:"unsupportedContentEncodings"`
+	ContentDecodingFailed       bool     `json:"contentDecodingFailed"`
 }
 
 func SendRepeaterRequest(payload RepeaterSendPayload) (RepeaterSendResult, error) {
@@ -95,20 +99,33 @@ func SendRepeaterRequest(payload RepeaterSendPayload) (RepeaterSendResult, error
 			return RepeaterSendResult{}, err
 		}
 
-		headBlockStr, bodyStr, err := h1x.ParseRawResponse(rawResponse, rawRequest)
+		headBlockStr, bodyStr, contentEncoding, err :=
+			h1x.ParseRawResponseWithContentEncoding(rawResponse, rawRequest)
+		contentDecodingFailed := false
 		if err != nil {
-			return RepeaterSendResult{}, err
+			var decodingErr *utils.ContentDecodingError
+			if !errors.As(err, &decodingErr) {
+				return RepeaterSendResult{}, err
+			}
+			contentDecodingFailed = true
+
+			bridge.EmitError(fmt.Sprintf(
+				"Could not decode the Repeater response body for inspection. Raw encoded data was preserved. Error: %v",
+				decodingErr,
+			))
 		}
 
 		durationMs := time.Since(startTime).Milliseconds()
 		return RepeaterSendResult{
-			HeadBlockStr: headBlockStr,
-			BodyStr:      bodyStr,
-			Host:         payload.Host,
-			Port:         payload.Port,
-			Version:      payload.Host,
-			StatusCode:   &startLineData.StatusCode,
-			DurationMs:   &durationMs,
+			HeadBlockStr:                headBlockStr,
+			BodyStr:                     bodyStr,
+			Host:                        payload.Host,
+			Port:                        payload.Port,
+			Version:                     startLineData.Version,
+			StatusCode:                  &startLineData.StatusCode,
+			DurationMs:                  &durationMs,
+			UnsupportedContentEncodings: utils.UnsupportedContentEncodings(contentEncoding),
+			ContentDecodingFailed:       contentDecodingFailed,
 		}, nil
 	} else { // #8 HTTP/2
 		// Enviar client connection preface
@@ -209,7 +226,23 @@ func SendRepeaterRequest(payload RepeaterSendPayload) (RepeaterSendResult, error
 			}
 		}()
 
-		resp := <-ch
+		resp, ok := <-ch
+		if !ok {
+			return RepeaterSendResult{}, io.ErrUnexpectedEOF
+		}
+		if resp.Error != nil {
+			return RepeaterSendResult{}, fmt.Errorf(
+				"reading HTTP/2 response stream: %w",
+				resp.Error,
+			)
+		}
+		if resp.DecodeError != nil {
+			bridge.EmitError(fmt.Sprintf(
+				"Could not decode the HTTP/2 Repeater response body for inspection. Raw encoded data was preserved. Error: %v",
+				resp.DecodeError,
+			))
+		}
+
 		headBlockStr, err := h2.BuildHTTP1HeadBlockStr(&resp)
 		if err != nil {
 			return RepeaterSendResult{}, fmt.Errorf("build http1 head block str: %w", err)
@@ -222,13 +255,15 @@ func SendRepeaterRequest(payload RepeaterSendPayload) (RepeaterSendResult, error
 
 		durationMs := time.Since(startTime).Milliseconds()
 		return RepeaterSendResult{
-			HeadBlockStr: headBlockStr,
-			BodyStr:      resp.Body,
-			Host:         payload.Host,
-			Port:         payload.Port,
-			Version:      payload.Version,
-			StatusCode:   &statusCode,
-			DurationMs:   &durationMs,
+			HeadBlockStr:                headBlockStr,
+			BodyStr:                     resp.Body,
+			Host:                        payload.Host,
+			Port:                        payload.Port,
+			Version:                     payload.Version,
+			StatusCode:                  &statusCode,
+			DurationMs:                  &durationMs,
+			UnsupportedContentEncodings: utils.UnsupportedContentEncodings(resp.ContentEncoding),
+			ContentDecodingFailed:       resp.DecodeError != nil,
 		}, nil
 	}
 }
